@@ -53,8 +53,20 @@ object PcapProcessor {
     .drop("proto").drop($"dst.src").drop("srcport").drop($"dst.dst").drop("dstport").drop($"dst.framelen").drop($"dst.dsn").drop($"dst.dack")
     .withColumn("latency", $"dst.timestamp" - $"src.timestamp")
   }
-
-
+  
+  
+  /**
+   * Loads the corresponding src/dst pcaps
+   * - group the src frames by dsn and assign "job" numbers
+   * - within each job on the src side, assign "task" numbers to the frames (re-sends of the frame)
+   * - sort by job/task numbers, and assign a global task index to each frame.
+   *   This can be used to plot the experiment path
+   * - Join the job/task index and src pcap to the dst pcap.
+   *   Not every frame is received at the dst, so this is a left outer join
+   * - This also produces jsrc_pcap and jdst_pcap, but I should get rid of those.
+   * 
+   * The three Datasets returned are persisted.
+   */
   def loadProcessPcapFull(spark:SparkSession, srcfile:String, dstfile:String): (Dataset[Row],Dataset[Row],Dataset[Row]) = {
     import spark.implicits._
 
