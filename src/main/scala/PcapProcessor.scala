@@ -15,17 +15,40 @@ import org.apache.spark.api.java.StorageLevels._
 
 object PcapProcessor {
 
+  /**
+   * Load the src and dst pcap files and pick out the first time where each
+   * MPTCP packet that is:
+   * 1. sent
+   * 2. recieved
+   * 
+   * This lets us compute the latency.
+   * 
+   * The loadProcessPcapFull() function below does all this and more, so this
+   * function may be both buggy and obsolete.  However it should be faster than
+   * loadProcessPcapFull() because it takes a coarser grouping of the frames
+   * and doesn't do as much processing.
+   */
   def loadProcessPcapLatency(spark:SparkSession, srcfile:String, dstfile:String): Dataset[Row] = {
     import spark.implicits._
-
+    
+    // XXX - based on what we know now, grouping by dack and dstport is probably a mistake
+    //       those fields will be different for packets sent over the different links
     val first_w = Window.partitionBy($"proto", $"dstport", $"dsn", $"dack").orderBy($"timestamp".asc)
+    
+    // read the src and dst pcaps
+    // We are only interested in TCP traffic, so filter for proto=6 right away
+    // Also we filter out rows with no DSN.  The missing DSN happens rarely, but
+    // Vu says it's a legitimate omission.
+    // TODO: deal with missing DSN, or show that we can discard those frames.
     val src_pcap = pcapReader.readPcap(spark, "/home/ikt/short-no-outage/iperf-interupted-lowrtt-on10-off3-sender-1.csv")
         .filter("proto=6").filter("dsn is not null").filter("dack is not null")
-        .withColumn("rn", row_number.over(first_w)).where("rn=1").drop("rn")
+        .withColumn("rn", row_number.over(first_w)).where("rn=1").drop("rn");
     val dst_pcap = pcapReader.readPcap(spark, "/home/ikt/short-no-outage/iperf-interupted-lowrtt-on10-off3-receiver-1.csv")
         .filter("proto=6").filter("dsn is not null").filter("dack is not null")
-        .withColumn("rn", row_number.over(first_w)).where("rn=1").drop("rn")
-
+        .withColumn("rn", row_number.over(first_w)).where("rn=1").drop("rn");
+    
+    // we join the two pcaps based on proto, dst, dstport, dsn, dack.
+    // XXX - based on what we know now, I think this is a mistake.
     return src_pcap.as("src").join(dst_pcap.as("dst"), $"src.proto"===$"dst.proto" && $"src.dst"===$"dst.dst" && $"src.dstport"===$"dst.dstport" && $"src.dsn"===$"dst.dsn" && $"src.dack"===$"dst.dack")
     .drop("proto").drop($"dst.src").drop("srcport").drop($"dst.dst").drop("dstport").drop($"dst.framelen").drop($"dst.dsn").drop($"dst.dack")
     .withColumn("latency", $"dst.timestamp" - $"src.timestamp")
