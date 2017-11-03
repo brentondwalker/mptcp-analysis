@@ -2,11 +2,12 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.SparkSession._
 import org.apache.spark.sql.Dataset
 import org.apache.spark.sql.Row
-import org.apache.spark.sql.types.{StructType, StructField, StringType, IntegerType, LongType, DoubleType, TimestampType}
-import org.apache.spark.sql.functions.udf
 import org.apache.spark.sql.functions._ // for `when`
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.api.java.StorageLevels._
+import vegas._
+import vegas.render.WindowRenderer._
+
 
 /**
  * This will be code to turn job/task event data into a table of
@@ -14,6 +15,9 @@ import org.apache.spark.api.java.StorageLevels._
  */
 
 object PcapProcessor {
+  val spark = SparkSession.builder.getOrCreate()
+  import spark.implicits._
+
 
   /**
    * Load the src and dst pcap files and pick out the first time where each
@@ -23,35 +27,27 @@ object PcapProcessor {
    * 
    * This lets us compute the latency.
    * 
-   * The loadProcessPcapFull() function below does all this and more, so this
-   * function may be both buggy and obsolete.  However it should be faster than
-   * loadProcessPcapFull() because it takes a coarser grouping of the frames
+   * This function ignores packets that are never recieved (that have latency
+   * of infinity).  In principle tcp should re-send packets until they get through,
+   * so any missing receptions are because of an error or truncation in the log.
+   * 
+   * The loadProcessPcapFull() function below does all this and more, but
+   * this should be faster because it takes a coarser grouping of the frames
    * and doesn't do as much processing.
    */
-  def loadProcessPcapLatency(spark:SparkSession, srcfile:String, dstfile:String): Dataset[Row] = {
-    import spark.implicits._
+  def loadProcessPcapLatency(srcfile:String, dstfile:String): Dataset[Row] = {
     
-    // XXX - based on what we know now, grouping by dack and dstport is probably a mistake
-    //       those fields will be different for packets sent over the different links
-    val first_w = Window.partitionBy($"proto", $"dstport", $"dsn", $"dack").orderBy($"timestamp".asc)
+    val first_w = Window.partitionBy($"dsn").orderBy($"timestamp".asc)
     
-    // read the src and dst pcaps
-    // We are only interested in TCP traffic, so filter for proto=6 right away
-    // Also we filter out rows with no DSN.  The missing DSN happens rarely, but
-    // Vu says it's a legitimate omission.
-    // TODO: deal with missing DSN, or show that we can discard those frames.
-    val src_pcap = pcapReader.readPcap(spark, "/home/ikt/short-no-outage/iperf-interupted-lowrtt-on10-off3-sender-1.csv")
+    val src_data = pcapReader.readPcap(spark, "/home/ikt/mshort-no-outage/iperf-interupted-re-on10-off3-sender-6.csv")
         .filter("proto=6").filter("dsn is not null").filter("dack is not null")
-        .withColumn("rn", row_number.over(first_w)).where("rn=1").drop("rn");
-    val dst_pcap = pcapReader.readPcap(spark, "/home/ikt/short-no-outage/iperf-interupted-lowrtt-on10-off3-receiver-1.csv")
+        .groupBy($"dsn").agg(min($"timestamp").alias("src_timestamp"))
+    val dst_data = pcapReader.readPcap(spark, "/home/ikt/mshort-no-outage/iperf-interupted-re-on10-off3-receiver-6.csv")
         .filter("proto=6").filter("dsn is not null").filter("dack is not null")
-        .withColumn("rn", row_number.over(first_w)).where("rn=1").drop("rn");
+        .groupBy($"dsn").agg(min($"timestamp").alias("dst_timestamp"))
     
-    // we join the two pcaps based on proto, dst, dstport, dsn, dack.
-    // XXX - based on what we know now, I think this is a mistake.
-    return src_pcap.as("src").join(dst_pcap.as("dst"), $"src.proto"===$"dst.proto" && $"src.dst"===$"dst.dst" && $"src.dstport"===$"dst.dstport" && $"src.dsn"===$"dst.dsn" && $"src.dack"===$"dst.dack")
-    .drop("proto").drop($"dst.src").drop("srcport").drop($"dst.dst").drop("dstport").drop($"dst.framelen").drop($"dst.dsn").drop($"dst.dack")
-    .withColumn("latency", $"dst.timestamp" - $"src.timestamp")
+    return src_data.as("src").join(dst_data.as("dst"), "dsn")
+      .withColumn("latency", $"dst_timestamp" - $"src_timestamp")
   }
   
   
@@ -67,12 +63,11 @@ object PcapProcessor {
    * 
    * The three Datasets returned are persisted.
    */
-  def loadProcessPcapFull(spark:SparkSession, srcfile:String, dstfile:String): (Dataset[Row],Dataset[Row],Dataset[Row]) = {
-    import spark.implicits._
+  def loadProcessPcapFull(srcfile:String, dstfile:String): (Dataset[Row],Dataset[Row],Dataset[Row]) = {
 
     val dsn_partition_w = Window.partitionBy($"dst", $"dsn").orderBy($"timestamp".asc)
     val sorted_w = Window.orderBy($"timestamp".asc)
-    val jt_sorted_w = Window.orderBy($"timestamp".asc)
+    val jt_sorted_w = Window.orderBy($"jobid".asc, $"taskid".asc)
     val taskid_w = Window.partitionBy($"jobid").orderBy($"timestamp".asc)
 
     // assume all packets are seen first at the src
@@ -129,6 +124,70 @@ object PcapProcessor {
     return (jsrc_pcap, jdst_pcap, jpcap)
 
   }
+  
+  
+  /**
+   * Extract the experiment path from jobid=start to jobid=end and return the 
+   * data in a form suitable for plotting with Vegas-viz.
+   * 
+   * The experiment path is a sequence of frames sorted by tasknum (that is, by
+   * jobid and taskid), with the timestamp recorded at both the src and dst ends.
+   * The dst timestamp may be null if the frame was dropped, in which case the
+   * dst frame will not appear in the returned array.
+   * 
+   * The job and task IDs are not currentl included in the result, because we
+   * aren't using them in the plots.
+   * 
+   * Example return value:
+   * Array(Map(ip -> "dst: 10.1.2.2 -> 10.1.1.2", pktnum -> 5129, t -> 1.5088584996016316E9), 
+   *       Map(ip -> "src: 10.1.2.2 -> 10.1.1.2", pktnum -> 5129, t -> 1.5088584995073369E9), 
+   *       Map(ip -> "dst: 10.1.3.2 -> 10.1.1.2", pktnum -> 5130, t -> 1.5088584995606186E9), 
+   *       Map(ip -> "src: 10.1.3.2 -> 10.1.1.2", pktnum -> 5130, t -> 1.5088584995078845E9), 
+   *       Map(ip -> "dst: 10.1.3.2 -> 10.1.1.2", pktnum -> 5131, t -> 1.5088584995626194E9))
+   */
+  def experimentPaths(jpcap:Dataset[Row], start:Int, end:Int): Array[Map[String,Any]] = {
+    
+    val tmp = jpcap.filter($"jobid" >= start && $"jobid" <= end).persist();
+
+    val result =  tmp.filter($"dst.timestamp".isNotNull).select(concat_ws(" ", lit("dst:"), $"src", lit("->"), $"dst"), $"tasknum", $"dst.timestamp".as("timestamp"))
+            .union(tmp.select(concat_ws(" ", lit("src:"), $"src", lit("->"), $"dst"), $"tasknum", $"src.timestamp".as("timestamp"))).orderBy("tasknum")
+            .collect().map( x => Map("ip"->x.getString(0), "pktnum"->x.getInt(1), "t"->x.getDouble(2)))
+
+    tmp.unpersist()
+
+    if (result.length == 0) {
+        println("ERROR: experimentPaths resulted in empty dataset")
+    }
+
+    return result
+  }
+
+  
+  /**
+   * A convenient wrapper for a particular style of Vegas plot.
+   * This is intended to be called with the result of the experimentPaths()
+   * function above.
+   */
+  def plotExpPath(data: Array[Map[String,Any]], title:String = "") {
+    if (data.length < 2) {
+      println("ERROR: plotExpPath() - not enoug data for plotting")
+      return
+    }
+    
+    Vegas("Experiment Path: "+title, width=1200, height=600)
+    .withData(data)
+    .mark(Point)
+    .encodeX("pktnum", Quant, scale=Scale(zero=false))
+    .encodeY("t", Quant, scale=Scale(zero=false))
+    .encodeColor(
+       field="ip",
+       dataType=Nominal,
+       legend=Legend(orient="left", title="timestamp"))
+    .encodeDetailFields(Field(field="symbol", dataType=Nominal))
+    .show
+  }
+  
+  
   
 }
 
