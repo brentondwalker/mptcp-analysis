@@ -39,16 +39,74 @@ object PcapProcessor {
     
     val first_w = Window.partitionBy($"dsn").orderBy($"timestamp".asc)
     
-    val src_data = pcapReader.readPcap(spark, "/home/ikt/mshort-no-outage/iperf-interupted-re-on10-off3-sender-6.csv")
+    val src_data = pcapReader.readPcap(spark, srcfile)
         .filter("proto=6").filter("dsn is not null").filter("dack is not null")
         .groupBy($"dsn").agg(min($"timestamp").alias("src_timestamp"))
-    val dst_data = pcapReader.readPcap(spark, "/home/ikt/mshort-no-outage/iperf-interupted-re-on10-off3-receiver-6.csv")
+    val dst_data = pcapReader.readPcap(spark, dstfile)
         .filter("proto=6").filter("dsn is not null").filter("dack is not null")
         .groupBy($"dsn").agg(min($"timestamp").alias("dst_timestamp"))
     
     return src_data.as("src").join(dst_data.as("dst"), "dsn")
       .withColumn("latency", $"dst_timestamp" - $"src_timestamp")
   }
+  
+  
+  /**
+   * Compute the CDF and CCDF of the latency data.
+   * 
+   * I tried doing this nicely in Spark, but ended up just collecting the
+   * data and computing it in the driver.  For the number of data points
+   * we have, this should be fine.
+   */
+  def latencyCdf(ldf:Dataset[Row], numpoints:Integer): (Array[Double], Array[Double]) = {
+    val ldfcount:Long = ldf.count();
+    val ldfcount_d = ldfcount.toDouble
+    val n = if (numpoints > 0) numpoints+1 else ldfcount+1
+    val incr = if (numpoints > 0) math.ceil(ldfcount_d/numpoints).toInt else 1;
+    val cdfx = new Array[Double] (n.toInt);
+    val cdfy = new Array[Double] (n.toInt);
+    val ldfs = ldf.select("latency").orderBy("latency").collect.map(x => x.getDouble(0));
+    
+    var i = 0;
+    var bin = 0;
+    println(incr)
+    ldfs.foreach( x => {
+        //println(""+i+"\t"+bin)
+        if ((i % incr) == 0) {
+            cdfx(bin) = x;
+            cdfy(bin) = i.toDouble/ldfcount_d;
+            bin += 1;
+        }
+        i += 1;
+    })
+    
+    return (cdfx, cdfy)
+  }
+  
+  /**
+   * A convenient wrapper for a particular style of Vegas plot.
+   * This is intended to be called with the result of the latencyCdf()
+   * function above.
+   */
+  def plotLatencyCdf(data: (Array[Double], Array[Double]), title:String = "") {
+    if (data._1.length < 2) {
+      println("ERROR: plotLatencyCdf() - not enoug data for plotting")
+      return
+    }
+    
+    if (data._1.length != data._2.length) {
+      println("ERROR: plotLatencyCdf() - data arrays must be te same length")
+      return
+    }
+    
+    Vegas("Latency CDF: "+title, width=1200, height=600)
+    .withData(data.zipped.toArray.map( x => Map("x"->x._1, "cdf"->x._2)))
+    .mark(Line)
+    .encodeX("x", Quant, scale=Scale(zero=false))
+    .encodeY("cdf", Quant, scale=Scale(zero=false))
+    .show
+  }
+
   
   
   /**
@@ -188,6 +246,7 @@ object PcapProcessor {
   }
   
   
+
   
 }
 
