@@ -17,6 +17,7 @@ import vegas.render.WindowRenderer._
 object PcapProcessor {
   val spark = SparkSession.builder.getOrCreate()
   import spark.implicits._
+  implicit val render = vegas.render.ShowHTML(s => print("%html " + s))
 
 
   /**
@@ -84,29 +85,41 @@ object PcapProcessor {
   }
   
   /**
-   * A convenient wrapper for a particular style of Vegas plot.
-   * This is intended to be called with the result of the latencyCdf()
-   * function above.
+   * Transform latency data into the form needed by the plot function.
    */
-  def plotLatencyCdf(data: (Array[Double], Array[Double]), title:String = "") {
-    if (data._1.length < 2) {
-      println("ERROR: plotLatencyCdf() - not enoug data for plotting")
-      return
+  def latencyDataPrep(data: (Array[Double], Array[Double]), title: String): Array[Map[String,Any]] = {
+		if (data._1.length < 2) {
+      println("ERROR: plotLatencyCdf() - not enough data for plotting")
+      return Array()
     }
     
     if (data._1.length != data._2.length) {
-      println("ERROR: plotLatencyCdf() - data arrays must be te same length")
-      return
+      println("ERROR: plotLatencyCdf() - data arrays must be the same length")
+      return Array()
     }
     
-    Vegas("Latency CDF: "+title, width=1200, height=600)
-    .withData(data.zipped.toArray.map( x => Map("x"->x._1, "cdf"->x._2)))
+    return data.zipped.toArray.map( x => Map("x"->x._1, "cdf"->x._2, "title"->title))
+  }
+  
+  
+  /**
+   * A convenient wrapper for a particular style of Vegas plot.
+   * This is intended to be called with the result of the latencyDataPrep()
+   * function above.
+   */
+  def plotLatencyCdf(data: Array[Map[String,Any]]) {
+    
+    Vegas("Latency CDF", width=1200, height=600)
+    .withData(data)
     .mark(Line)
     .encodeX("x", Quant, scale=Scale(zero=false))
     .encodeY("cdf", Quant, scale=Scale(zero=false))
+    .encodeColor(
+       field="title",
+       dataType=Nominal,
+       legend=Legend(orient="left", title="timestamp"))
     .show
   }
-
   
   
   /**
