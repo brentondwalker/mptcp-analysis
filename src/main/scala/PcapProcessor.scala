@@ -7,6 +7,8 @@ import org.apache.spark.sql.expressions.Window
 import org.apache.spark.api.java.StorageLevels._
 import vegas._
 import vegas.render.WindowRenderer._
+import org.apache.spark.mllib.stat.KernelDensity
+import org.apache.spark.rdd.RDD
 
 
 /**
@@ -120,6 +122,44 @@ object PcapProcessor {
        legend=Legend(orient="left", title="timestamp"))
     .show
   }
+  
+  
+  /**
+   * Estimate the pdf of latency data
+   */
+  def latencyPdf(data:Dataset[Row]): Array[(Double,Double)] = {
+
+		  val rtmp = data.select(min("latency"),max("latency")).first;
+		  val (lmin, lmax) = (rtmp.getDouble(0), rtmp.getDouble(1));
+		  val numpoints = 250d;
+		  val evalpoints = lmin to lmax by ((lmax-lmin)/numpoints) toArray;
+		  val bandwidth = ((lmax-lmin)/numpoints);
+
+		  val kd = new KernelDensity()
+				  .setSample(data.select("latency").map( x => x.getDouble(0) ).rdd)
+				  .setBandwidth(bandwidth);
+
+		  // Find density estimates for the given values
+		  val densities = kd.estimate(evalpoints);
+
+		  return evalpoints.zip(densities)
+  }
+  
+  
+  /*
+  def latencyCcdf(pdf: Array[(Double,Double)]): Array[(Double,Double)] = {
+    var cum:Double = 1.0
+    
+    val ccdf:Array[(Double,Double)] = pdf.foreach( x => {
+      val (a,b) = x
+    	cum -= b;
+    	(a, cum)
+    })
+    
+    return pdf
+  }
+  * */
+  */
   
   
   /**
