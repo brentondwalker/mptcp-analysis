@@ -5,8 +5,6 @@ import org.apache.spark.sql.Row
 import org.apache.spark.sql.functions._ // for `when`
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.api.java.StorageLevels._
-import vegas._
-import vegas.render.WindowRenderer._
 import org.apache.spark.mllib.stat.KernelDensity
 import org.apache.spark.rdd.RDD
 
@@ -18,7 +16,6 @@ import org.apache.spark.rdd.RDD
 object PcapProcessor {
   val spark = SparkSession.builder.getOrCreate()
   import spark.implicits._
-  implicit val render = vegas.render.ShowHTML(s => print("%html " + s))
 
 
   /**
@@ -36,6 +33,9 @@ object PcapProcessor {
    * The loadProcessPcapFull() function below does all this and more, but
    * this should be faster because it takes a coarser grouping of the frames
    * and doesn't do as much processing.
+   * 
+   * TODO: the DSN will eventually roll over.  There should be a time difference limit
+   *       in the join.
    */
   def loadProcessPcapLatency(srcfile:String, dstfile:String): Dataset[Row] = {
     
@@ -85,48 +85,12 @@ object PcapProcessor {
     return (cdfx, cdfy)
   }
   
-  /**
-   * Transform latency data into the form needed by the plot function.
-   */
-  def latencyDataPrep(data: (Array[Double], Array[Double]), title: String): Array[Map[String,Any]] = {
-		if (data._1.length < 2) {
-      println("ERROR: plotLatencyCdf() - not enough data for plotting")
-      return Array()
-    }
     
-    if (data._1.length != data._2.length) {
-      println("ERROR: plotLatencyCdf() - data arrays must be the same length")
-      return Array()
-    }
-    
-    return data.zipped.toArray.map( x => Map("x"->x._1, "cdf"->x._2, "title"->title))
-  }
-  
   
   /**
-   * A convenient wrapper for a particular style of Vegas plot.
-   * This is intended to be called with the result of the latencyDataPrep()
-   * function above.
+   * Estimate the pdf of latency data using mllib's KernelDensity class.
    */
-  def plotLatencyCdf(data: Array[Map[String,Any]]) {
-        
-    Vegas("Latency CDF", width=1200, height=600)
-    .withData(data)
-    .mark(Line)
-    .encodeX("x", Quant, scale=Scale(zero=false))
-    .encodeY("cdf", Quant, scale=Scale(zero=false))
-    .encodeColor(
-       field="title",
-       dataType=Nominal,
-       legend=Legend(orient="left", title="timestamp"))
-    .show
-  }
-  
-  
-  /**
-   * Estimate the pdf of latency data
-   */
-  def latencyPdf(data:Dataset[Row]): Array[(Double,Double)] = {
+  def latencyPdf(data:Dataset[Row]): (Array[Double], Array[Double]) = {
 
 		  val rtmp = data.select(min("latency"),max("latency")).first;
 		  val (lmin, lmax) = (rtmp.getDouble(0), rtmp.getDouble(1));
@@ -141,16 +105,22 @@ object PcapProcessor {
 		  // Find density estimates for the given values
 		  val densities = kd.estimate(evalpoints);
 
-		  return evalpoints.zip(densities)
+		  //return evalpoints.zip(densities)
+		  return (evalpoints, densities)
   }
   
   
   /**
    * Compute the ccdf of latency data from the PDF estimated by latencyPdf().
    * 
-   * This returns a structure suitable for plotting with Vegas.
    */
-  def latencyCcdf(pdf: Array[(Double,Double)], title: String): Array[Map[String,Any]] = {
+  def latencyCcdf(pdf_cols: (Array[Double], Array[Double]), title: String): Array[Map[String,Any]] = {
+    if (pdf_cols._1.length != pdf_cols._2.length) {
+      println("ERROR: latencyCcdf() data arrays must be the same length.")
+      return Array()
+    }
+    
+    val pdf = pdf_cols._1.zip(pdf_cols._2)
     var cum:Double = 1.0
     var last_x = -1.0
     
@@ -163,19 +133,15 @@ object PcapProcessor {
       (x._1, cum)
     })
         
-    return ccdf.map( x => Map("x"->x._1, "ccdf"->x._2, "title"->title) )
+    return ccdf.map( x => Map("x"->x._1, "y"->x._2, "title"->title) )
   }
   
+  
   /**
-   * Plot the CCDF on log-log axes
+   * Compute a histogram of latency data.
    */
-  def plotLatencyLogCcdf(ccdf: Array[Map[String,Any]]) {
-    Vegas("Latency CCDF", width=600, height=600)
-      .withData(ccdf)
-      .mark(Line)
-      .encodeX("x", Quant, scale=Scale(Some(vegas.ScaleType.Log)))
-      .encodeY("ccdf", Quant, scale=Scale(Some(vegas.ScaleType.Log)))
-      .show
+  def latencyHistogram(jpcap_l: Dataset[Row], bins:Int = 50): (Array[Double], Array[Long]) = {
+    return jpcap_l.select("latency").map(x => x.getDouble(0)).rdd.histogram(bins)
   }
   
   
@@ -190,6 +156,10 @@ object PcapProcessor {
    * - This also produces jsrc_pcap and jdst_pcap, but I should get rid of those.
    * 
    * The three Datasets returned are persisted.
+   * 
+   * TODO: the DSN will eventually roll over.  There should be a time difference limit
+   *       in the join.
+   * 
    */
   def loadProcessPcapFull(srcfile:String, dstfile:String): (Dataset[Row],Dataset[Row],Dataset[Row]) = {
 
@@ -263,7 +233,7 @@ object PcapProcessor {
    * The dst timestamp may be null if the frame was dropped, in which case the
    * dst frame will not appear in the returned array.
    * 
-   * The job and task IDs are not currentl included in the result, because we
+   * The job and task IDs are not currently included in the result, because we
    * aren't using them in the plots.
    * 
    * Example return value:
@@ -291,29 +261,6 @@ object PcapProcessor {
   }
 
   
-  /**
-   * A convenient wrapper for a particular style of Vegas plot.
-   * This is intended to be called with the result of the experimentPaths()
-   * function above.
-   */
-  def plotExpPath(data: Array[Map[String,Any]], title:String = "") {
-    if (data.length < 2) {
-      println("ERROR: plotExpPath() - not enoug data for plotting")
-      return
-    }
-    
-    Vegas("Experiment Path: "+title, width=1200, height=600)
-    .withData(data)
-    .mark(Point)
-    .encodeX("pktnum", Quant, scale=Scale(zero=false))
-    .encodeY("t", Quant, scale=Scale(zero=false))
-    .encodeColor(
-       field="ip",
-       dataType=Nominal,
-       legend=Legend(orient="left", title="timestamp"))
-    .encodeDetailFields(Field(field="symbol", dataType=Nominal))
-    .show
-  }
   
   
 
