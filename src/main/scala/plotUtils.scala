@@ -1,5 +1,6 @@
 import vegas._
 import vegas.render.WindowRenderer._
+import vegas.sparkExt._
 
 object plotUtils {
   
@@ -7,6 +8,18 @@ object plotUtils {
    * Need this to plot in Zeppelin notebook.
    */
   implicit val render = vegas.render.ShowHTML(s => print("%html " + s))
+  
+  
+  /**
+   * Make a convenient and persistent way to set the size of the plots.
+   */
+  var plot_size_x = 300
+  var plot_size_y = 300
+    
+  def setPlotSize(x:Int, y:Int) {
+    plot_size_x = x
+    plot_size_y = y
+  }
   
   
   /**
@@ -45,7 +58,7 @@ object plotUtils {
       println("ERROR: multiLineLogPlot() - not enough data for plotting.")
       return
     }
-    Vegas(plotname, width=600, height=600)
+    Vegas(plotname, width=plot_size_x, height=plot_size_y)
       .withData(data)
       .mark(Line)
       .encodeX("x", Quant, scale=Scale(zero=false))
@@ -53,7 +66,7 @@ object plotUtils {
       .encodeColor(
          field="title",
          dataType=Nominal,
-         legend=Legend(orient="left", title=title))
+         legend=Legend(orient="top-left", offset=30, title=title))
       .show
   }
   
@@ -71,7 +84,7 @@ object plotUtils {
       println("ERROR: multiLineLogPlot() - not enough data for plotting.")
       return
     }
-    Vegas(plotname, width=1200, height=600)
+    Vegas(plotname, width=plot_size_x, height=plot_size_y)
     .withData(data)
     .mark(Line)
     .encodeX("x", Quant, scale=Scale(zero=false))
@@ -79,7 +92,7 @@ object plotUtils {
     .encodeColor(
        field="title",
        dataType=Nominal,
-       legend=Legend(orient="left", title=title))
+       legend=Legend(orient="top-left", offset=30, title=title))
     .show
   }
   
@@ -95,7 +108,7 @@ object plotUtils {
       return
     }
     
-    Vegas("Experiment Path: "+title, width=1200, height=600)
+    Vegas("Experiment Path: "+title, width=plot_size_x, height=plot_size_y)
     .withData(data)
     .mark(Point)
     .encodeX("pktnum", Quant, scale=Scale(zero=false))
@@ -103,7 +116,7 @@ object plotUtils {
     .encodeColor(
        field="ip",
        dataType=Nominal,
-       legend=Legend(orient="left", title="timestamp"))
+       legend=Legend(orient="top-left", offset=30, title="timestamp"))
     .encodeDetailFields(Field(field="symbol", dataType=Nominal))
     .show
   }

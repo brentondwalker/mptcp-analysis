@@ -7,6 +7,7 @@ import org.apache.spark.sql.expressions.Window
 import org.apache.spark.api.java.StorageLevels._
 import org.apache.spark.mllib.stat.KernelDensity
 import org.apache.spark.rdd.RDD
+import scala.collection.mutable.ListBuffer
 
 /**
  * This will be code to turn job/task event data into a table of
@@ -61,28 +62,36 @@ object PcapProcessor {
    * we have, this should be fine.
    */
   def latencyCdf(ldf:Dataset[Row], numpoints:Integer): (Array[Double], Array[Double]) = {
-    val ldfcount:Long = ldf.count();
+        val ldfcount:Long = ldf.count();
     val ldfcount_d = ldfcount.toDouble
     val n = if (numpoints > 0) numpoints+1 else ldfcount+1
-    val incr = if (numpoints > 0) math.ceil(ldfcount_d/numpoints).toInt else 1;
-    val cdfx = new Array[Double] (n.toInt);
-    val cdfy = new Array[Double] (n.toInt);
+    val cdfx = new ListBuffer[Double] ();
+    val cdfy = new ListBuffer[Double] ();
     val ldfs = ldf.select("latency").orderBy("latency").collect.map(x => x.getDouble(0));
+    val rtmp = ldf.select(min("latency"),max("latency")).first;
+    val (lmin, lmax) = (rtmp.getDouble(0), rtmp.getDouble(1));
+    val x_incr = (lmax - lmin)/n
+    val y_incr = ldfcount/n
     
     var i = 0;
     var bin = 0;
-    println(incr)
+    var next_x_threshold = lmin
+    var next_y_threshold = 0l
+    //println(x_incr)
+    //println(y_incr)
     ldfs.foreach( x => {
         //println(""+i+"\t"+bin)
-        if ((i % incr) == 0) {
-            cdfx(bin) = x;
-            cdfy(bin) = i.toDouble/ldfcount_d;
+        if (x >= next_x_threshold || i >= next_y_threshold) {
+            cdfx += x;
+            cdfy += i.toDouble/ldfcount_d;
             bin += 1;
+            next_x_threshold += x_incr
+            next_y_threshold += y_incr
         }
         i += 1;
     })
     
-    return (cdfx, cdfy)
+    return (cdfx.toArray, cdfy.toArray)
   }
   
   
@@ -110,10 +119,57 @@ object PcapProcessor {
   
   
   /**
+   * Compute the CCDF of the latency data.
+   * 
+   * I tried doing this nicely in Spark, but ended up just collecting the
+   * data and computing it in the driver.  For the number of data points
+   * we have, this should be fine.
+   * 
+   * TODO: The size of the array this returns is problematic for large datasets.
+   *       We need to gradually scale the increment down.
+   */
+  def latencyCcdf(ldf:Dataset[Row], numpoints:Integer): (Array[Double], Array[Double]) = {
+    val ldfcount:Long = ldf.count();
+    val ldfcount_d = ldfcount.toDouble
+    val n = if (numpoints > 0) numpoints+1 else ldfcount+1
+    val cdfx = new ListBuffer[Double] ();
+    val cdfy = new ListBuffer[Double] ();
+    val ldfs = ldf.select("latency").orderBy("latency").collect.map(x => x.getDouble(0));
+    val rtmp = ldf.select(min("latency"),max("latency")).first;
+    val (lmin, lmax) = (rtmp.getDouble(0), rtmp.getDouble(1));
+    val x_incr = (lmax - lmin)/n
+    val y_incr = ldfcount/n
+    
+    var i = 0;
+    var bin = 0;
+    var next_x_threshold = lmin
+    var next_y_threshold = 0l
+    val tail_y_threshold = ldfcount * 997 / 1000
+    //println(x_incr)
+    //println(y_incr)
+    //println(tail_y_threshold)
+    ldfs.foreach( x => {
+        //println(""+i+"\t"+bin)
+        if (x >= next_x_threshold || i >= next_y_threshold || i >= tail_y_threshold) {
+            cdfx += x;
+            cdfy += 1.0 - i.toDouble/ldfcount_d;
+            bin += 1;
+            next_x_threshold += x_incr
+            next_y_threshold += y_incr
+        }
+        i += 1;
+    })
+    
+    return (cdfx.toArray, cdfy.toArray)
+  }
+
+  
+  
+  /**
    * Compute the ccdf of latency data from the PDF estimated by latencyPdf().
    * 
    */
-  def latencyCcdf(pdf_cols: (Array[Double], Array[Double]), title: String): Array[Map[String,Any]] = {
+  def latencyKernelCcdf(pdf_cols: (Array[Double], Array[Double]), title: String): Array[Map[String,Any]] = {
     if (pdf_cols._1.length != pdf_cols._2.length) {
       println("ERROR: latencyCcdf() data arrays must be the same length.")
       return Array()
