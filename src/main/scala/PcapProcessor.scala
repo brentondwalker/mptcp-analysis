@@ -10,7 +10,6 @@ import vegas.render.WindowRenderer._
 import org.apache.spark.mllib.stat.KernelDensity
 import org.apache.spark.rdd.RDD
 
-
 /**
  * This will be code to turn job/task event data into a table of
  * job/task data with arrive/start/end times and total durations computed
@@ -110,7 +109,7 @@ object PcapProcessor {
    * function above.
    */
   def plotLatencyCdf(data: Array[Map[String,Any]]) {
-    
+        
     Vegas("Latency CDF", width=1200, height=600)
     .withData(data)
     .mark(Line)
@@ -146,19 +145,38 @@ object PcapProcessor {
   }
   
   
-  /*
-  def latencyCcdf(pdf: Array[(Double,Double)]): Array[(Double,Double)] = {
+  /**
+   * Compute the ccdf of latency data from the PDF estimated by latencyPdf().
+   * 
+   * This returns a structure suitable for plotting with Vegas.
+   */
+  def latencyCcdf(pdf: Array[(Double,Double)], title: String): Array[Map[String,Any]] = {
     var cum:Double = 1.0
+    var last_x = -1.0
     
-    val ccdf:Array[(Double,Double)] = pdf.foreach( x => {
-      val (a,b) = x
-    	cum -= b;
-    	(a, cum)
+    // the map should operate sequentially
+    val ccdf = pdf.map( x => {
+      if (last_x >= 0) {
+    	  cum -= (x._1 - last_x) * x._2
+      }
+      last_x = x._1
+      (x._1, cum)
     })
-    
-    return pdf
+        
+    return ccdf.map( x => Map("x"->x._1, "ccdf"->x._2, "title"->title) )
   }
-  */
+  
+  /**
+   * Plot the CCDF on log-log axes
+   */
+  def plotLatencyLogCcdf(ccdf: Array[Map[String,Any]]) {
+    Vegas("Latency CCDF", width=600, height=600)
+      .withData(ccdf)
+      .mark(Line)
+      .encodeX("x", Quant, scale=Scale(Some(vegas.ScaleType.Log)))
+      .encodeY("ccdf", Quant, scale=Scale(Some(vegas.ScaleType.Log)))
+      .show
+  }
   
   
   /**
