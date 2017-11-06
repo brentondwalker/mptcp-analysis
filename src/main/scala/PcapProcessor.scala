@@ -85,7 +85,6 @@ object PcapProcessor {
     return (cdfx, cdfy)
   }
   
-    
   
   /**
    * Estimate the pdf of latency data using mllib's KernelDensity class.
