@@ -15,8 +15,8 @@ import scala.collection.mutable.ListBuffer
  */
 
 object PcapProcessor {
-  val spark = SparkSession.builder.getOrCreate()
-  import spark.implicits._
+  val lspark = SparkSession.builder.getOrCreate()
+  import lspark.implicits._
 
 
   /**
@@ -35,21 +35,72 @@ object PcapProcessor {
    * this should be faster because it takes a coarser grouping of the frames
    * and doesn't do as much processing.
    * 
+   * There have been problems of negative latencies.  Two possible causes of that are:
+   * 
+   * - we captured an ack.  Then the dst is the sender, and when we compute
+   *   dst.timestamp - src.timestamp we get the negative of its actual latency.
+   *   Ahokey solution is to filter out framelen<100.
+   *   
+   * - the packet has multiple sends, and multiple receives, but we only capture the
+   *   last send.  In this case, if we just group by DSN, we can see packets that are
+   *   received before any recorded transmissions.  It seems to happen only at the start
+   *   of a capture, especially for the redundant scheduler.  The most correct solution
+   *   here is to make sure that any received frame actually has a recorded
+   *   transmission.  The simple, and close to correct, solution is to just filter out
+   *   negative latencies.
+   * 
    * TODO: the DSN will eventually roll over.  There should be a time difference limit
    *       in the join.
+   *       
+   *  TODO: how to filter out traffic from dst back to src?
    */
   def loadProcessPcapLatency(srcfile:String, dstfile:String): Dataset[Row] = {
     
-    val first_w = Window.partitionBy($"dsn").orderBy($"timestamp".asc)
-    
-    val src_data = pcapReader.readPcap(spark, srcfile)
-        .filter("proto=6").filter("dsn is not null").filter("dack is not null")
+    val src_data = pcapReader.readPcap(lspark, srcfile)
+        .filter("proto=6").filter("framelen>100").filter("dsn is not null").filter("dack is not null")
         .groupBy($"dsn").agg(min($"timestamp").alias("src_timestamp"))
-    val dst_data = pcapReader.readPcap(spark, dstfile)
-        .filter("proto=6").filter("dsn is not null").filter("dack is not null")
+    val dst_data = pcapReader.readPcap(lspark, dstfile)
+        .filter("proto=6").filter("framelen>100").filter("dsn is not null").filter("dack is not null")
         .groupBy($"dsn").agg(min($"timestamp").alias("dst_timestamp"))
     
     return src_data.as("src").join(dst_data.as("dst"), "dsn")
+      .withColumn("latency", $"dst_timestamp" - $"src_timestamp")
+  }
+  
+  
+  /**
+   * This is a more involved way to load latency data, where we check that each
+   * received frame has a corresponding sent frame.  This eliminates a mismatch
+   * that can happen sometimes when the packets are flying already when tshark starts.
+   * It is a rare problem (maybe 30 packets out of 100,000), so it's really better
+   * to just filter the negative latencies out, or be more careful when starting
+   * the experiment.
+   */
+  def loadProcessPcapLatencyCareful(srcfile:String, dstfile:String): Dataset[Row] = {
+    val dsn_partition_w = Window.partitionBy($"dst", $"dsn").orderBy($"timestamp".asc)
+    
+    val src_data = pcapReader.readPcap(lspark, srcfile)
+        .filter("proto=6").filter("dsn is not null").persist(MEMORY_AND_DISK_SER);
+
+    val src_timestamp_data = src_data.groupBy($"dsn").agg(min($"timestamp").alias("src_timestamp"));
+    
+    val dst_data = pcapReader.readPcap(lspark, dstfile)
+        .filter("proto=6").filter("dsn is not null")
+        .withColumn("rxnum", row_number.over(dsn_partition_w)).where("rxnum=1");
+
+    // this is where we make sure that each of our "first" frames collected at the dst
+    // has a corresponding frame collected at the src.
+    val dst_timestamp_data = dst_data.as("dst1").join(src_data.as("src1"), 
+          $"src1.dsn"===$"dst1.dsn" 
+          && $"src1.src"===$"dst1.src"
+          && $"src1.srcport"===$"dst1.srcport"
+          && $"src1.dst"===$"dst1.dst"
+          && $"src1.dstport"===$"dst1.dstport"
+          && $"src1.tcpseq"===$"dst1.tcpseq"
+          && $"src1.tcpack"===$"dst1.tcpack")
+        .select($"dst1.dsn".alias("dsn"), $"dst1.timestamp".alias("dst_timestamp"))
+        
+    return src_timestamp_data.as("src").join(dst_timestamp_data.as("dst"), "dsn")
       .withColumn("latency", $"dst_timestamp" - $"src_timestamp")
   }
   
@@ -224,10 +275,10 @@ object PcapProcessor {
     val taskid_w = Window.partitionBy($"jobid").orderBy($"timestamp".asc)
 
     // assume all packets are seen first at the src
-    val src_pcap = pcapReader.readPcap(spark, srcfile)
-        .filter("proto=6").filter("dsn is not null").filter("dack is not null")
-    val dst_pcap = pcapReader.readPcap(spark, dstfile)
-        .filter("proto=6").filter("dsn is not null").filter("dack is not null").persist(MEMORY_AND_DISK_SER);
+    val src_pcap = pcapReader.readPcap(lspark, srcfile)
+        .filter("proto=6").filter("dsn is not null")  //.filter("dack is not null")
+    val dst_pcap = pcapReader.readPcap(lspark, dstfile)
+        .filter("proto=6").filter("dsn is not null").persist(MEMORY_AND_DISK_SER);  //.filter("dack is not null").persist(MEMORY_AND_DISK_SER);
     println("src records: "+src_pcap.count())
     println("dst records: "+dst_pcap.count())
     
