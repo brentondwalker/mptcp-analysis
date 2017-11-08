@@ -37,9 +37,10 @@ object PcapProcessor {
    * 
    * There have been problems of negative latencies.  Two possible causes of that are:
    * 
-   * - we captured an ack.  Then the dst is the sender, and when we compute
-   *   dst.timestamp - src.timestamp we get the negative of its actual latency.
-   *   Ahokey solution is to filter out framelen<100.
+   * - we captured some reverse traffic (like ACK).  Then the dst is the sender,
+   *   and when we compute dst.timestamp - src.timestamp we get the negative of its
+   *   actual latency.  We now include the packets dst in the table, so those cases
+   *   can be filtered out.
    *   
    * - the packet has multiple sends, and multiple receives, but we only capture the
    *   last send.  In this case, if we just group by DSN, we can see packets that are
@@ -57,10 +58,10 @@ object PcapProcessor {
   def loadProcessPcapLatency(srcfile:String, dstfile:String): Dataset[Row] = {
     
     val src_data = pcapReader.readPcap(lspark, srcfile)
-        .filter("proto=6").filter("framelen>100").filter("dsn is not null").filter("dack is not null")
-        .groupBy($"dsn").agg(min($"timestamp").alias("src_timestamp"))
+        .filter("proto=6").filter("dsn is not null").filter("dack is not null")
+        .groupBy($"dsn").agg(min($"timestamp").alias("src_timestamp"),min("dst").alias("dst"))
     val dst_data = pcapReader.readPcap(lspark, dstfile)
-        .filter("proto=6").filter("framelen>100").filter("dsn is not null").filter("dack is not null")
+        .filter("proto=6").filter("dsn is not null").filter("dack is not null")
         .groupBy($"dsn").agg(min($"timestamp").alias("dst_timestamp"))
     
     return src_data.as("src").join(dst_data.as("dst"), "dsn")
@@ -75,6 +76,8 @@ object PcapProcessor {
    * It is a rare problem (maybe 30 packets out of 100,000), so it's really better
    * to just filter the negative latencies out, or be more careful when starting
    * the experiment.
+   * 
+   * TODO: this is not working correctly on wget trace #8.  The tcp seq number just don't match.
    */
   def loadProcessPcapLatencyCareful(srcfile:String, dstfile:String): Dataset[Row] = {
     val dsn_partition_w = Window.partitionBy($"dst", $"dsn").orderBy($"timestamp".asc)
@@ -82,7 +85,7 @@ object PcapProcessor {
     val src_data = pcapReader.readPcap(lspark, srcfile)
         .filter("proto=6").filter("dsn is not null").persist(MEMORY_AND_DISK_SER);
 
-    val src_timestamp_data = src_data.groupBy($"dsn").agg(min($"timestamp").alias("src_timestamp"));
+    val src_timestamp_data = src_data.groupBy($"dsn").agg(min($"timestamp").alias("src_timestamp"),min("dst").alias("dst"));
     
     val dst_data = pcapReader.readPcap(lspark, dstfile)
         .filter("proto=6").filter("dsn is not null")
@@ -102,6 +105,15 @@ object PcapProcessor {
         
     return src_timestamp_data.as("src").join(dst_timestamp_data.as("dst"), "dsn")
       .withColumn("latency", $"dst_timestamp" - $"src_timestamp")
+  }
+  
+  
+  def checkNegativeLatencies(pcap_l_list: Array[Dataset[Row]]) {
+      for (pcap_l <- pcap_l_list) {
+        println("total records: "+pcap_l.count)
+        println("negative latencies:"+pcap_l.filter($"latency" < 0.0).count)
+        pcap_l.filter($"latency" < 0.0).show
+      }
   }
   
   
