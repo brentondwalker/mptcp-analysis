@@ -39,7 +39,7 @@ object PcapProcessor {
    * 
    * - we captured some reverse traffic (like ACK).  Then the dst is the sender,
    *   and when we compute dst.timestamp - src.timestamp we get the negative of its
-   *   actual latency.  We now include the packets dst in the table, so those cases
+   *   actual latency.  We now include the packets' dst in the table, so those cases
    *   can be filtered out.
    *   
    * - the packet has multiple sends, and multiple receives, but we only capture the
@@ -47,8 +47,8 @@ object PcapProcessor {
    *   received before any recorded transmissions.  It seems to happen only at the start
    *   of a capture, especially for the redundant scheduler.  The most correct solution
    *   here is to make sure that any received frame actually has a recorded
-   *   transmission.  The simple, and close to correct, solution is to just filter out
-   *   negative latencies.
+   *   transmission, *or* be more careful in starting the experiments.  The simple,
+   *   and close to correct, solution is to just filter out negative latencies.
    * 
    * TODO: the DSN will eventually roll over.  There should be a time difference limit
    *       in the join.
@@ -108,6 +108,10 @@ object PcapProcessor {
   }
   
   
+  /**
+   * Use this to track down issues with negative latencies.
+   * Hopefully they are all solved anyway.
+   */
   def checkNegativeLatencies(pcap_l_list: Array[Dataset[Row]]) {
       for (pcap_l <- pcap_l_list) {
         println("total records: "+pcap_l.count)
@@ -265,21 +269,18 @@ object PcapProcessor {
   
   /**
    * Loads the corresponding src/dst pcaps
-   * - group the src frames by dsn and assign "job" numbers
+   * - group the src frames by DSN and assign "job" numbers in the order the DSNs first appear
    * - within each job on the src side, assign "task" numbers to the frames (re-sends of the frame)
    * - sort by job/task numbers, and assign a global task index to each frame.
    *   This can be used to plot the experiment path
    * - Join the job/task index and src pcap to the dst pcap.
    *   Not every frame is received at the dst, so this is a left outer join
-   * - This also produces jsrc_pcap and jdst_pcap, but I should get rid of those.
-   * 
-   * The three Datasets returned are persisted.
    * 
    * TODO: the DSN will eventually roll over.  There should be a time difference limit
    *       in the join.
    * 
    */
-  def loadProcessPcapFull(srcfile:String, dstfile:String): (Dataset[Row],Dataset[Row],Dataset[Row]) = {
+  def loadProcessPcapFull(srcfile:String, dstfile:String): Dataset[Row] = {
 
     val dsn_partition_w = Window.partitionBy($"dst", $"dsn").orderBy($"timestamp".asc)
     val sorted_w = Window.orderBy($"timestamp".asc)
@@ -290,40 +291,27 @@ object PcapProcessor {
     val src_pcap = pcapReader.readPcap(lspark, srcfile)
         .filter("proto=6").filter("dsn is not null")  //.filter("dack is not null")
     val dst_pcap = pcapReader.readPcap(lspark, dstfile)
-        .filter("proto=6").filter("dsn is not null").persist(MEMORY_AND_DISK_SER);  //.filter("dack is not null").persist(MEMORY_AND_DISK_SER);
-    println("src records: "+src_pcap.count())
-    println("dst records: "+dst_pcap.count())
+        .filter("proto=6").filter("dsn is not null")   //.filter("dack is not null").persist(MEMORY_AND_DISK_SER);
     
     // unfortunately there's no way to assign an ordering and dense rank to the partitions.
     // otherwise we could compute the job and task IDs at the same time.
-    // dense_rank doesn't do it because we want to partition by one thing, but order by timestamp.
+    // dense_rank doesn't do it because we want to partition by DSN, but order the partitions by timestamp.
     // This will compute job IDs by grouping the src packets by (dst,dstport,dsn,dack),
     // taking the first row from each partition, and then assigning a rank to those representatives.
     val jobid_index = src_pcap.withColumn("rn", row_number.over(dsn_partition_w)).where("rn=1").drop("rn")
         .withColumn("jobid", row_number.over(sorted_w))
         .drop("timestamp", "framenumber", "proto", "tcpseq", "tcpack", "framelen", "src", "srcport", "dstport", "dack")
     
-    // now we have to join this back onto the source_pcap
-    // and on the last line, compute the task IDs
+    // now we have to join the job IDs back onto the source_pcap
+    // and compute the task IDs
     val jsrc_pcap = src_pcap.as("src").join(jobid_index.as("job"), $"src.dst"===$"job.dst" && $"src.dsn"===$"job.dsn", "left_outer")  // && $"src.dack"===$"job.dack", "left_outer")
         .withColumn("taskid", row_number.over(taskid_w))
         .withColumn("tasknum", row_number.over(jt_sorted_w))
         .drop($"job.dst").drop($"job.dsn")
         .orderBy("tasknum")
-        .persist(MEMORY_AND_DISK_SER);
     
     // now we finally have a table of jobid, taskid and associated fields
-    val taskid_index = jsrc_pcap.select("jobid", "taskid", "tasknum", "dst", "dstport", "dsn", "dack", "tcpseq", "tcpack").persist(MEMORY_AND_DISK_SER);
-    
-    // join the job/task IDs onto the packets at the dst
-    val jdst_pcap = dst_pcap.as("dst").join(taskid_index.as("p"), $"dst.dst"===$"p.dst" &&$"dst.dstport"===$"p.dstport" && $"dst.dsn"===$"p.dsn" && $"dst.dack"===$"p.dack" && $"dst.tcpseq"===$"p.tcpseq" && $"dst.tcpack"===$"p.tcpack", "left_outer")
-        .filter($"tasknum".isNotNull)
-        .drop($"p.dst").drop($"p.dstport").drop($"p.dsn").drop($"p.dack").drop($"p.tcpseq").drop($"p.tcpack")
-        .orderBy("tasknum")
-        .persist(MEMORY_AND_DISK_SER);
-    
-    //jsrc_pcap.show()
-    //jdst_pcap.show()
+    //val taskid_index = jsrc_pcap.select("jobid", "taskid", "tasknum", "dst", "dstport", "dsn", "dack", "tcpseq", "tcpack")
     
     // finally, join the src and dst pcaps into one big dataset.
     // this can be used to see the packets dropped (dst.timestamp will be null), or latency.
@@ -332,13 +320,8 @@ object PcapProcessor {
         .drop($"dst.src").drop($"dst.srcport").drop($"dst.dst").drop($"dst.dstport").drop($"dst.proto").drop($"dst.framelen")
         .drop($"dst.tcpseq").drop($"dst.tcpack").drop($"dst.dsn").drop($"dst.dack").drop($"dst.framenumber").drop($"src.framenumber")
         .orderBy("tasknum")
-        .persist(MEMORY_AND_DISK_SER);
     
-    dst_pcap.unpersist();
-    taskid_index.unpersist();
-    
-    return (jsrc_pcap, jdst_pcap, jpcap)
-
+    return jpcap
   }
   
   
