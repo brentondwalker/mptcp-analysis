@@ -337,19 +337,23 @@ object PcapProcessor {
    * The job and task IDs are not currently included in the result, because we
    * aren't using them in the plots.
    * 
+   * The timestamps are translated so that the earliest src packet appears at time 0.0
+   * 
    * Example return value:
-   * Array(Map(ip -> "dst: 10.1.2.2 -> 10.1.1.2", pktnum -> 5129, t -> 1.5088584996016316E9), 
-   *       Map(ip -> "src: 10.1.2.2 -> 10.1.1.2", pktnum -> 5129, t -> 1.5088584995073369E9), 
-   *       Map(ip -> "dst: 10.1.3.2 -> 10.1.1.2", pktnum -> 5130, t -> 1.5088584995606186E9), 
-   *       Map(ip -> "src: 10.1.3.2 -> 10.1.1.2", pktnum -> 5130, t -> 1.5088584995078845E9), 
-   *       Map(ip -> "dst: 10.1.3.2 -> 10.1.1.2", pktnum -> 5131, t -> 1.5088584995626194E9))
+   * Array(Map(ip -> "dst: 10.1.2.2 -> 10.1.1.2", pktnum -> 5129, t -> 0.051397085189819336), 
+   *       Map(ip -> "src: 10.1.2.2 -> 10.1.1.2", pktnum -> 5129, t -> 0.0), 
+   *       Map(ip -> "dst: 10.1.3.2 -> 10.1.1.2", pktnum -> 5130, t -> 0.15339207649230957), 
+   *       Map(ip -> "src: 10.1.3.2 -> 10.1.1.2", pktnum -> 5130, t -> 0.10199308395385742), 
+   *       Map(ip -> "dst: 10.1.3.2 -> 10.1.1.2", pktnum -> 5131, t -> 0.2965109348297119))
    */
   def experimentPaths(jpcap:Dataset[Row], start:Int, end:Int): Array[Map[String,Any]] = {
     
     val tmp = jpcap.filter($"jobid" >= start && $"jobid" <= end).persist();
-
-    val result =  tmp.filter($"dst.timestamp".isNotNull).select(concat_ws(" ", lit("dst:"), $"src", lit("->"), $"dst"), $"tasknum", $"dst.timestamp".as("timestamp"))
-            .union(tmp.select(concat_ws(" ", lit("src:"), $"src", lit("->"), $"dst"), $"tasknum", $"src.timestamp".as("timestamp"))).orderBy("tasknum")
+    
+    val start_time = jpcap.select(min("src.timestamp")).first.getDouble(0)
+    
+    val result =  tmp.filter($"dst.timestamp".isNotNull).select(concat_ws(" ", lit("dst:"), $"src", lit("->"), $"dst"), $"tasknum", ($"dst.timestamp"-lit(start_time)).as("timestamp"))
+            .union(tmp.select(concat_ws(" ", lit("src:"), $"src", lit("->"), $"dst"), $"tasknum", ($"src.timestamp"-lit(start_time)).as("timestamp"))).orderBy("tasknum")
             .collect().map( x => Map("ip"->x.getString(0), "pktnum"->x.getInt(1), "t"->x.getDouble(2)))
 
     tmp.unpersist()
