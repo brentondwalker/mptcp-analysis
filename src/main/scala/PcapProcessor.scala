@@ -373,6 +373,8 @@ object PcapProcessor {
    * 
    * Essentially this function just computes the range of jobs that have their start within
    * this time range, and then calls the normal experimentPaths() function.
+   * 
+   * TODO: this will throw an exception if invalid time values are passed in.  Fix that!
    */
   def experimentPathsTime(jpcap:Dataset[Row], start:Double, end:Double, strict_bound:Boolean=false): Array[Map[String,Any]] = {
     
@@ -387,17 +389,11 @@ object PcapProcessor {
         .select(min("jobid"))
         .first.getInt(0)
         
-      // get job id of the last job that completes entirely within the time bounds
-      // partition the frames by jobid, and within the partitions pick the one that has
-      // the maximum timestamp.
-      // Finally, find the smallest jobid that violates that bound and subtract 1
-        val job_partition_w = Window.partitionBy($"jobid").orderBy($"maxtime".desc)
-        val jobs_after_window = jpcap.filter($"jobid" >= start_job)
-          .withColumn("maxtime", greatest("src.timestamp","dst.timestamp") - start_time)
-          .withColumn("rn", row_number.over(job_partition_w)).where("rn=1")
-          .filter($"maxtime" > end)
-        end_job = if (jobs_after_window.head(1).isEmpty) jpcap.select(max("jobid")).first.getInt(0)
-                  else jobs_after_window.select(min("jobid")).first.getInt(0) - 1
+        // get job id of the last job that completes entirely within the time bounds
+        end_job = jpcap
+            .withColumn("maxtime", greatest("src.timestamp","dst.timestamp") - start_time)
+            .filter($"maxtime" > end)
+            .select(min("jobid")).first.getInt(0) - 1
 
     } else {
       val job_bounds = jpcap.filter("taskid=1")
