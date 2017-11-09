@@ -388,9 +388,9 @@ object PcapProcessor {
         .first.getInt(0)
         
       // get job id of the last job that completes entirely within the time bounds
-      // partition the frames by jobid, and within the partitions order them by timestamp,
-      // descending.  Then the first thing in each partition will be the final frame event.
-      // find the smallest jobid that violates that bound and subtract 1
+      // partition the frames by jobid, and within the partitions pick the one that has
+      // the maximum timestamp.
+      // Finally, find the smallest jobid that violates that bound and subtract 1
         val job_partition_w = Window.partitionBy($"jobid").orderBy($"maxtime".desc)
         val jobs_after_window = jpcap.filter($"jobid" >= start_job)
           .withColumn("maxtime", greatest("src.timestamp","dst.timestamp") - start_time)
