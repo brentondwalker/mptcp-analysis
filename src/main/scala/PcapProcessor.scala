@@ -337,7 +337,7 @@ object PcapProcessor {
    * The job and task IDs are not currently included in the result, because we
    * aren't using them in the plots.
    * 
-   * The timestamps are translated so that the earliest src packet appears at time 0.0
+   * The timestamps are translated so that the earliest src frame appears at time 0.0
    * 
    * Example return value:
    * Array(Map(ip -> "dst: 10.1.2.2 -> 10.1.1.2", pktnum -> 5129, t -> 0.051397085189819336), 
@@ -363,6 +363,58 @@ object PcapProcessor {
     }
 
     return result
+  }
+  
+  
+  /**
+   * Same as the experimentPaths() function above, except it takes time values as the
+   * start/end points.  Note that this will select the MP packets that first appear in
+   * this time range, so the actual range of times in the resulting data may be a bit longer.
+   * 
+   * Essentially this function just computes the range of jobs that have their start within
+   * this time range, and then calls the normal experimentPaths() function.
+   */
+  def experimentPathsTime(jpcap:Dataset[Row], start:Double, end:Double, strict_bound:Boolean=false): Array[Map[String,Any]] = {
+    
+    val start_time = jpcap.select(min("src.timestamp")).first.getDouble(0)
+    var start_job = 0
+    var end_job = 0
+    
+    if (strict_bound) {
+      // getting the start time is easy
+       start_job = jpcap.filter("taskid=1")
+        .filter($"src.timestamp" >= (start+start_time) && $"src.timestamp" <= (end+start_time))
+        .select(min("jobid"))
+        .first.getInt(0)
+        
+      // get job id of the last job that completes entirely within the time bounds
+      // partition the frames by jobid, and within the partitions order them by timestamp,
+      // descending.  Then the first thing in each partition will be the final frame event.
+      // find the smallest jobid that violates that bound and subtract 1
+        val job_partition_w = Window.partitionBy($"jobid").orderBy($"maxtime".desc)
+        val jobs_after_window = jpcap.filter($"jobid" >= start_job)
+          .withColumn("maxtime", greatest("src.timestamp","dst.timestamp") - start_time)
+          .withColumn("rn", row_number.over(job_partition_w)).where("rn=1")
+          .filter($"maxtime" > end)
+        end_job = if (jobs_after_window.head(1).isEmpty) jpcap.select(max("jobid")).first.getInt(0)
+                  else jobs_after_window.select(min("jobid")).first.getInt(0) - 1
+
+    } else {
+      val job_bounds = jpcap.filter("taskid=1")
+        .filter($"src.timestamp" >= (start+start_time) && $"src.timestamp" <= (end+start_time))
+        .select(min("jobid"), max("jobid"))
+        .first
+    
+      start_job = job_bounds.getInt(0)
+      end_job = job_bounds.getInt(1)
+    }
+    
+    if (start_job >= end_job) {
+        println("WARNING: experimentPathsTime() - time bounds contain no data points")
+        return Array()
+    }
+
+    return experimentPaths(jpcap, start_job, end_job)
   }
 
   
