@@ -8,6 +8,8 @@ import org.apache.spark.api.java.StorageLevels._
 import org.apache.spark.mllib.stat.KernelDensity
 import org.apache.spark.rdd.RDD
 import scala.collection.mutable.ListBuffer
+import org.apache.spark.sql.types._
+
 
 /**
  * This will be code to turn job/task event data into a table of
@@ -278,6 +280,9 @@ object PcapProcessor {
    * 
    * TODO: the DSN will eventually roll over.  There should be a time difference limit
    *       in the join.
+   *       
+   * XXX: the caller can filter the result by dst in order to remove acks and other traffic
+   *      in the other direction, but then the jobIDs are not a dense index anymore.
    * 
    */
   def loadProcessPcapFull(srcfile:String, dstfile:String): Dataset[Row] = {
@@ -371,8 +376,11 @@ object PcapProcessor {
    * start/end points.  Note that this will select the MP packets that first appear in
    * this time range, so the actual range of times in the resulting data may be a bit longer.
    * 
-   * Essentially this function just computes the range of jobs that have their start within
+   * This function just computes the range of job IDs that have their start within
    * this time range, and then calls the normal experimentPaths() function.
+   * 
+   * Especially when called with strict_bound=true, this version is more complex than
+   * the normal experimentPaths function.
    * 
    * TODO: this will throw an exception if invalid time values are passed in.  Fix that!
    */
@@ -414,7 +422,50 @@ object PcapProcessor {
   }
 
   
-  
+  /**
+   * I don't know why this is not working!!!
+   * 
+   * import org.apache.spark.sql.expressions.Window
+   * import spark.implicits._
+   * 
+   * val df = Seq((1, "a"), (1, "a"), (2, "a"), (1, "b"), (2, "b"), (3, "b"), (1,"b"), (5,"b"),(6,"b")).toDF("id", "category")
+   * val byCategoryOrderedById = Window.partitionBy('category).orderBy('id).rangeBetween(Window.currentRow, 3)
+   * df.withColumn("sum", sum('id) over byCategoryOrderedById).orderBy("category","id").show
+   */
+  def throughput(jpcap:Dataset[Row], windowSize:Double, destination:String, start:Double, end:Double) {
+      val job_partition_w = Window.partitionBy($"jobid").orderBy($"dst.timestamp".asc)
+      
+      val datascale:Double = 1.0e9
+      
+      val windowSize_l:Long = (windowSize*datascale).toLong
+      val sliding_tp_w = Window.partitionBy($"rxnum").orderBy($"ts").rangeBetween(0, windowSize_l)  //Window.currentRow,(windowSize*1.0e12).toLong)
+      val throughput_factor = 1.0 / windowSize
+      
+      val start_l:Long = (start * datascale).toLong
+      val end_l:Long = (end * datascale).toLong
+      println("sliding window range: "+windowSize_l)
+      println("start_l:              "+start_l)
+      println("endl                  "+end_l)
+
+      val start_time = jpcap.select(min("src.timestamp")).first.getDouble(0)
+      val rxtrace = jpcap.filter("dst.timestamp is not null")
+          .withColumn("rxnum", row_number.over(job_partition_w))
+          .withColumn("tsd", $"dst.timestamp" - start_time)
+          .withColumn("ts", (($"dst.timestamp" - start_time)*datascale).cast(LongType))
+          .filter($"ts" >= start_l && $"ts" <= end_l)
+          .orderBy("jobid")
+          .persist(MEMORY_AND_DISK)
+        rxtrace.filter("rxnum = 1").show
+       
+      // now we can get the first reception of each packet
+      rxtrace.filter("rxnum = 1")
+          .withColumn("throughput", sum("framelen").over(sliding_tp_w) * throughput_factor)
+          .withColumn("pktcount", sum(lit(1)).over(sliding_tp_w))
+          .show
+      
+      // we can get the redundant recptions
+      rxtrace.filter("rxnum > 1")
+  }
   
 
   
