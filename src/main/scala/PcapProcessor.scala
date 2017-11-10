@@ -423,29 +423,34 @@ object PcapProcessor {
 
   
   /**
-   * I don't know why this is not working!!!
+   * Compute the throughput in terms of bytes and number of packets over a sliding time window.
    * 
-   * import org.apache.spark.sql.expressions.Window
-   * import spark.implicits._
+   * The throughput is measured at the dst as the first reception of each packet.  Each packet may
+   * be received multiple times if there are resends, but the throughput is only computed for the
+   * first reception.  The second return value is the redundant throughput, which is the rate data
+   * is being received in frames with rxnum > 1.
    * 
-   * val df = Seq((1, "a"), (1, "a"), (2, "a"), (1, "b"), (2, "b"), (3, "b"), (1,"b"), (5,"b"),(6,"b")).toDF("id", "category")
-   * val byCategoryOrderedById = Window.partitionBy('category).orderBy('id).rangeBetween(Window.currentRow, 3)
-   * df.withColumn("sum", sum('id) over byCategoryOrderedById).orderBy("category","id").show
+   * The function now returns an array of data points suitable for plotting with Vegas-viz.
+   * 
+   * This computes throughput at the first reception time of each packet, which isn't ideal; if there
+   * are no packets arriving, then there are no data points, but when there are lots of packets
+   * arriving, then there many many essentially redundant datapoints.  This will especially be an
+   * issue for computing redundant throughput, which will be about zero most of the time for 
+   * most schedulers, resulting in no datapoints.
+   * 
+   * TODO: it may be better to compute the throughput at regular intervals, say every 0.1s.
    */
-  def throughput(jpcap:Dataset[Row], windowSize:Double, destination:String, start:Double, end:Double) {
+  def throughput(jpcap:Dataset[Row], windowSize:Double, destination:String, start:Double, end:Double, label:String): Array[Map[String,Any]] = {
       val job_partition_w = Window.partitionBy($"jobid").orderBy($"dst.timestamp".asc)
       
-      val datascale:Double = 1.0e9
+      val datascale:Double = 1.0e6
       
       val windowSize_l:Long = (windowSize*datascale).toLong
-      val sliding_tp_w = Window.partitionBy($"rxnum").orderBy($"ts").rangeBetween(0, windowSize_l)  //Window.currentRow,(windowSize*1.0e12).toLong)
+      val sliding_tp_w = Window.orderBy($"ts").rangeBetween(0, windowSize_l)  //Window.currentRow,(windowSize*1.0e12).toLong)
       val throughput_factor = 1.0 / windowSize
       
       val start_l:Long = (start * datascale).toLong
       val end_l:Long = (end * datascale).toLong
-      println("sliding window range: "+windowSize_l)
-      println("start_l:              "+start_l)
-      println("endl                  "+end_l)
 
       val start_time = jpcap.select(min("src.timestamp")).first.getDouble(0)
       val rxtrace = jpcap.filter("dst.timestamp is not null")
@@ -453,21 +458,31 @@ object PcapProcessor {
           .withColumn("tsd", $"dst.timestamp" - start_time)
           .withColumn("ts", (($"dst.timestamp" - start_time)*datascale).cast(LongType))
           .filter($"ts" >= start_l && $"ts" <= end_l)
-          .orderBy("jobid")
+          .orderBy("ts")
           .persist(MEMORY_AND_DISK)
-        rxtrace.filter("rxnum = 1").show
-       
+      
       // now we can get the first reception of each packet
-      rxtrace.filter("rxnum = 1")
+      val tput = rxtrace.filter("rxnum = 1")
           .withColumn("throughput", sum("framelen").over(sliding_tp_w) * throughput_factor)
           .withColumn("pktcount", sum(lit(1)).over(sliding_tp_w))
-          .show
-      
+
       // we can get the redundant recptions
-      rxtrace.filter("rxnum > 1")
+      val redundant_tput = rxtrace.filter("rxnum > 1")
+          .withColumn("throughput", sum("framelen").over(sliding_tp_w) * throughput_factor)
+          .withColumn("pktcount", sum(lit(1)).over(sliding_tp_w))
+
+      val tp_label = label + " throughput"
+      val tpr_label = label + " redundant"
+
+      val tpdata = tput.select(lit(tp_label), $"tsd", $"throughput", $"pktcount")
+        .union(redundant_tput.select(lit(tpr_label), $"tsd", $"throughput", $"pktcount")).orderBy("tsd")
+        .collect().map( x => Map("title"->x.getString(0), "x"->x.getDouble(1), "y"->x.getDouble(2), "pktcount"->x.getLong(3)))
+        
+      rxtrace.unpersist()
+      
+      return tpdata
   }
   
-
   
 }
 
