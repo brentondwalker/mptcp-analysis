@@ -61,14 +61,34 @@ object PcapProcessor {
     
     val src_data = pcapReader.readPcap(lspark, srcfile)
         .filter("proto=6").filter("dsn is not null").filter("dack is not null")
-        .groupBy($"dsn").agg(min($"timestamp").alias("src_timestamp"),min("dst").alias("dst"))
+        .groupBy($"dsn").agg(min($"timestamp").alias("src_timestamp"),min("dst").alias("dst"),min("framelen").alias("src_len"))
     val dst_data = pcapReader.readPcap(lspark, dstfile)
         .filter("proto=6").filter("dsn is not null").filter("dack is not null")
-        .groupBy($"dsn").agg(min($"timestamp").alias("dst_timestamp"))
+        .groupBy($"dsn").agg(min($"timestamp").alias("dst_timestamp"),min("framelen").alias("dst_len"))
     
     return src_data.as("src").join(dst_data.as("dst"), "dsn")
       .withColumn("latency", $"dst_timestamp" - $"src_timestamp")
   }
+  
+  
+  /**
+   * If we are processing normal TCP (not TCPMP) then there are no DSN or DACK.
+   * 
+   * The resulting latency table is the same, though.
+   */
+  def loadProcessPcapLatencyTcp(srcfile:String, dstfile:String): Dataset[Row] = {
+    
+    val src_data = pcapReader.readPcap(lspark, srcfile)
+        .filter("proto=6").filter("tcpseq is not null").filter("tcpack is not null")
+        .groupBy($"tcpseq").agg(min($"timestamp").alias("src_timestamp"),min("dst").alias("dst"),min("framelen").alias("src_len"))
+    val dst_data = pcapReader.readPcap(lspark, dstfile)
+        .filter("proto=6").filter("tcpseq is not null").filter("tcpack is not null")
+        .groupBy($"tcpseq").agg(min($"timestamp").alias("dst_timestamp"),min("framelen").alias("dst_len"))
+    
+    return src_data.as("src").join(dst_data.as("dst"), "tcpseq")
+      .withColumn("latency", $"dst_timestamp" - $"src_timestamp")
+  }
+
   
   
   /**
@@ -87,7 +107,7 @@ object PcapProcessor {
     val src_data = pcapReader.readPcap(lspark, srcfile)
         .filter("proto=6").filter("dsn is not null").persist(MEMORY_AND_DISK_SER);
 
-    val src_timestamp_data = src_data.groupBy($"dsn").agg(min($"timestamp").alias("src_timestamp"),min("dst").alias("dst"));
+    val src_timestamp_data = src_data.groupBy($"dsn").agg(min($"timestamp").alias("src_timestamp"),min("dst").alias("dst"),min("framelen").alias("src_len"));
     
     val dst_data = pcapReader.readPcap(lspark, dstfile)
         .filter("proto=6").filter("dsn is not null")
@@ -103,7 +123,7 @@ object PcapProcessor {
           && $"src1.dstport"===$"dst1.dstport"
           && $"src1.tcpseq"===$"dst1.tcpseq"
           && $"src1.tcpack"===$"dst1.tcpack")
-        .select($"dst1.dsn".alias("dsn"), $"dst1.timestamp".alias("dst_timestamp"))
+        .select($"dst1.dsn".alias("dsn"), $"dst1.timestamp".alias("dst_timestamp"), $"dst1.framelen".alias("dst_len"))
         
     return src_timestamp_data.as("src").join(dst_timestamp_data.as("dst"), "dsn")
       .withColumn("latency", $"dst_timestamp" - $"src_timestamp")
@@ -329,6 +349,52 @@ object PcapProcessor {
     return jpcap
   }
   
+  
+  /**
+   * If we are processing normal TCP (not TCPMP) then there are no DSN or DACK.
+   * 
+   * The resulting jpcap may be a little different too.  It may lack dsn and dack columns,
+   * they may have all null entries.
+   */
+  def loadProcessPcapFullTcp(srcfile:String, dstfile:String): Dataset[Row] = {
+
+    val tcpseq_partition_w = Window.partitionBy($"dst", $"tcpseq").orderBy($"timestamp".asc)
+    val sorted_w = Window.orderBy($"timestamp".asc)
+    val jt_sorted_w = Window.orderBy($"jobid".asc, $"taskid".asc)
+    val taskid_w = Window.partitionBy($"jobid").orderBy($"timestamp".asc)
+
+    // assume all packets are seen first at the src
+    val src_pcap = pcapReader.readPcap(lspark, srcfile)
+        .filter("proto=6").filter("tcpseq is not null")  //.filter("dack is not null")
+    val dst_pcap = pcapReader.readPcap(lspark, dstfile)
+        .filter("proto=6").filter("tcpseq is not null")   //.filter("dack is not null").persist(MEMORY_AND_DISK_SER);
+    
+    val jobid_index = src_pcap.withColumn("rn", row_number.over(tcpseq_partition_w)).where("rn=1").drop("rn")
+        .withColumn("jobid", row_number.over(sorted_w))
+        .drop("timestamp", "framenumber", "proto", "framelen", "src", "srcport", "dstport")
+    
+    // now we have to join the job IDs back onto the source_pcap
+    // and compute the task IDs
+    val jsrc_pcap = src_pcap.as("src").join(jobid_index.as("job"), $"src.dst"===$"job.dst" && $"src.tcpseq"===$"job.tcpseq", "left_outer")  // && $"src.dack"===$"job.dack", "left_outer")
+        .withColumn("taskid", row_number.over(taskid_w))
+        .withColumn("tasknum", row_number.over(jt_sorted_w))
+        .drop($"job.dst").drop($"job.tcpseq")
+        .orderBy("tasknum")
+    
+    // now we finally have a table of jobid, taskid and associated fields
+    //val taskid_index = jsrc_pcap.select("jobid", "taskid", "tasknum", "dst", "dstport", "dsn", "dack", "tcpseq", "tcpack")
+    
+    // finally, join the src and dst pcaps into one big dataset.
+    // this can be used to see the packets dropped (dst.timestamp will be null), or latency.
+    val jpcap = jsrc_pcap.as("src")
+        .join(dst_pcap.as("dst"), $"dst.dst"===$"src.dst" && $"dst.dstport"===$"src.dstport" && $"dst.tcpseq"===$"src.tcpseq" && $"dst.tcpack"===$"src.tcpack", "left_outer")
+        .drop($"dst.src").drop($"dst.srcport").drop($"dst.dst").drop($"dst.dstport").drop($"dst.proto").drop($"dst.framelen")
+        .drop($"dst.tcpseq").drop($"dst.tcpack").drop($"dst.framenumber").drop($"src.framenumber")
+        .orderBy("tasknum")
+    
+    return jpcap
+  }
+
   
   /**
    * Extract the experiment path from jobid=start to jobid=end and return the 
