@@ -550,6 +550,30 @@ object PcapProcessor {
   }
   
   
+  /**
+   * compute the interval between successive packets at the src and dst
+   * 
+   * NOTE: if the jpcap passed in has the smaller frames filtered out, then 
+   *       the resulting IPSs will have some invalid datapoints.
+   */
+  def interpacketTimes(jpcap:Dataset[Row]): (Dataset[Row],Dataset[Row]) = {
+    val timeorder_src_w = Window.partitionBy("src").orderBy("timestamp")
+    val timeorder_dst_w = Window.partitionBy("dst").orderBy("timestamp")
+    
+    // extract the src IPTs
+    val src_ipt = jpcap.select($"src.timestamp".alias("timestamp"), $"framelen", $"src")
+      .withColumn("ipt", $"timestamp" - lag($"timestamp",1).over(timeorder_src_w))
+
+    // extract the dst IPTs
+    val dst_ipt = jpcap.filter("dst.timestamp is not null")
+      .select($"dst.timestamp".alias("timestamp"), $"framelen", $"dst")
+      .withColumn("ipt", $"timestamp" - lag($"timestamp",1).over(timeorder_dst_w))
+    
+
+    return (src_ipt, dst_ipt)
+  }
+  
+  
 }
 
 
