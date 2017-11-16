@@ -43,8 +43,33 @@ object plotUtils {
 
      return data.zipped.toArray.map( x => Map("x"->x._1, "y"->x._2, "title"->title))
   }
-    
-    
+
+
+  /**
+   * A convenient wrapper for a particular style of Vegas plot with logarithmic x and y-axis.
+   * This is intended to be called with the result of the vegasData() function above.
+   * 
+   * The data points (each is  Map) should have the data labeld by "x" and "y",
+   * and each point should have an entry for "title" which will be used for
+   * associating the data series and labeling them.
+   */
+  def multiLineLogLogPlot(data: Array[Map[String,Any]], plotname:String = "my plot", title:String = "data series") {
+    if (data.length < 2) {
+      println("ERROR: multiLineLogPlot() - not enough data for plotting.")
+      return
+    }
+    Vegas(plotname, width=plot_size_x, height=plot_size_y)
+      .withData(data)
+      .mark(Line)
+      .encodeX("x", Quant, scale=Scale(Some(vegas.ScaleType.Log)))
+      .encodeY("y", Quant, scale=Scale(Some(vegas.ScaleType.Log)))
+      .encodeColor(
+         field="title",
+         dataType=Nominal,
+         legend=Legend(orient="top-left", offset=30, title=title))
+      .show
+  }
+
   /**
    * A convenient wrapper for a particular style of Vegas plot with logarithmic y-axis.
    * This is intended to be called with the result of the vegasData() function above.
@@ -53,7 +78,7 @@ object plotUtils {
    * and each point should have an entry for "title" which will be used for
    * associating the data series and labeling them.
    */
-  def multiLineLogPlot(data: Array[Map[String,Any]], plotname:String = "my plot", title:String = "data series") {
+  def multiLineLogYPlot(data: Array[Map[String,Any]], plotname:String = "my plot", title:String = "data series") {
     if (data.length < 2) {
       println("ERROR: multiLineLogPlot() - not enough data for plotting.")
       return
@@ -68,6 +93,39 @@ object plotUtils {
          dataType=Nominal,
          legend=Legend(orient="top-left", offset=30, title=title))
       .show
+  }
+
+  /**
+   * A convenient wrapper for a particular style of Vegas plot with logarithmic x-axis.
+   * This is intended to be called with the result of the vegasData() function above.
+   * 
+   * The data points (each is  Map) should have the data labeld by "x" and "y",
+   * and each point should have an entry for "title" which will be used for
+   * associating the data series and labeling them.
+   */
+  def multiLineLogXPlot(data: Array[Map[String,Any]], plotname:String = "my plot", title:String = "data series") {
+    if (data.length < 2) {
+      println("ERROR: multiLineLogPlot() - not enough data for plotting.")
+      return
+    }
+    Vegas(plotname, width=plot_size_x, height=plot_size_y)
+      .withData(data)
+      .mark(Line)
+      .encodeX("x", Quant, scale=Scale(Some(vegas.ScaleType.Log)))
+      .encodeY("y", Quant, scale=Scale(zero=false))
+      .encodeColor(
+         field="title",
+         dataType=Nominal,
+         legend=Legend(orient="top-left", offset=30, title=title))
+      .show
+  }
+  
+  
+  /**
+   * Convenient plot wrapper.  This is for backward-compatibility.  It does a log-y plot.
+   */
+  def multiLineLogPlot(data: Array[Map[String,Any]], plotname:String = "my plot", title:String = "data series") {
+    multiLineLogYPlot(data, plotname, title)
   }
   
   

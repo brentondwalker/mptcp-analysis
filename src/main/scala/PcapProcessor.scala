@@ -371,14 +371,14 @@ object PcapProcessor {
     
     val jobid_index = src_pcap.withColumn("rn", row_number.over(tcpseq_partition_w)).where("rn=1").drop("rn")
         .withColumn("jobid", row_number.over(sorted_w))
-        .drop("timestamp", "framenumber", "proto", "framelen", "src", "srcport", "dstport")
+        .drop("timestamp", "framenumber", "proto", "framelen", "src", "srcport", "dstport", "dsn", "dack")
     
     // now we have to join the job IDs back onto the source_pcap
     // and compute the task IDs
     val jsrc_pcap = src_pcap.as("src").join(jobid_index.as("job"), $"src.dst"===$"job.dst" && $"src.tcpseq"===$"job.tcpseq", "left_outer")  // && $"src.dack"===$"job.dack", "left_outer")
         .withColumn("taskid", row_number.over(taskid_w))
         .withColumn("tasknum", row_number.over(jt_sorted_w))
-        .drop($"job.dst").drop($"job.tcpseq")
+        .drop($"job.dst").drop($"job.tcpseq").drop($"job.tcpack")
         .orderBy("tasknum")
     
     // now we finally have a table of jobid, taskid and associated fields
@@ -389,7 +389,8 @@ object PcapProcessor {
     val jpcap = jsrc_pcap.as("src")
         .join(dst_pcap.as("dst"), $"dst.dst"===$"src.dst" && $"dst.dstport"===$"src.dstport" && $"dst.tcpseq"===$"src.tcpseq" && $"dst.tcpack"===$"src.tcpack", "left_outer")
         .drop($"dst.src").drop($"dst.srcport").drop($"dst.dst").drop($"dst.dstport").drop($"dst.proto").drop($"dst.framelen")
-        .drop($"dst.tcpseq").drop($"dst.tcpack").drop($"dst.framenumber").drop($"src.framenumber")
+        //.drop($"dst.tcpseq").drop($"dst.tcpack")
+        .drop($"dst.dsn").drop($"dst.dack").drop($"dst.framenumber").drop($"src.framenumber")
         .orderBy("tasknum")
     
     return jpcap
@@ -569,9 +570,43 @@ object PcapProcessor {
       .select($"dst.timestamp".alias("timestamp"), $"framelen", $"dst")
       .withColumn("ipt", $"timestamp" - lag($"timestamp",1).over(timeorder_dst_w))
     
-
-    return (src_ipt, dst_ipt)
+    return (src_ipt.filter("ipt is not null"), dst_ipt.filter("ipt is not null"))
   }
+  
+  
+  /**
+   * Estimate the pdf of latency data using mllib's KernelDensity class.
+   * 
+   * XXX: we do two operations on the data Dataset, and who knows what goes on inside KernelDensity.
+   *      Should we persist/unpersist it?  Te issue would be if it's already persisted, we don't want
+   *      to unpersist it.
+   */
+  def genericPdf(data:Dataset[Row], colname:String, numpoints:Double): (Array[Double], Array[Double]) = {
+      
+      val is_cached = data.rdd.getStorageLevel.useMemory || data.rdd.getStorageLevel.useDisk || data.rdd.getStorageLevel.useOffHeap
+      if (! is_cached) {
+        data.persist()
+      }
+		  val rtmp = data.filter(colname+" is not null").select(min(colname),max(colname)).first;
+		  val (lmin, lmax) = (rtmp.getDouble(0), rtmp.getDouble(1));
+		  val evalpoints = lmin to lmax by ((lmax-lmin)/numpoints) toArray;
+		  val bandwidth = ((lmax-lmin)/numpoints);
+
+		  val kd = new KernelDensity()
+				  .setSample(data.select(colname).map( x => x.getDouble(0) ).rdd)
+				  .setBandwidth(bandwidth);
+
+		  // Find density estimates for the given values
+		  val densities = kd.estimate(evalpoints);
+
+		  if (! is_cached) {
+        data.unpersist()
+      }
+
+		  //return evalpoints.zip(densities)
+		  return (evalpoints, densities)
+  }
+
   
   
 }
