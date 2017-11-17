@@ -9,6 +9,7 @@ import org.apache.spark.mllib.stat.KernelDensity
 import org.apache.spark.rdd.RDD
 import scala.collection.mutable.ListBuffer
 import org.apache.spark.sql.types._
+import org.apache.spark.sql.catalyst.util.DateTimeUtils
 
 
 /**
@@ -499,11 +500,13 @@ object PcapProcessor {
    * 
    * The function now returns an array of data points suitable for plotting with Vegas-viz.
    * 
-   * This computes throughput at the first reception time of each packet, which isn't ideal; if there
+   * This computes throughput at the reception time of each packet, which isn't ideal; if there
    * are no packets arriving, then there are no data points, but when there are lots of packets
    * arriving, then there many many essentially redundant datapoints.  This will especially be an
    * issue for computing redundant throughput, which will be about zero most of the time for 
    * most schedulers, resulting in no datapoints.
+   * 
+   * See the rollingThroughput() function below for something a little more regular.
    * 
    * TODO: it may be better to compute the throughput at regular intervals, say every 0.1s.
    */
@@ -513,26 +516,31 @@ object PcapProcessor {
       val datascale:Double = 1.0e6
       
       val windowSize_l:Long = (windowSize*datascale).toLong
-      val sliding_tp_w = Window.orderBy($"ts").rangeBetween(0, windowSize_l)  //Window.currentRow,(windowSize*1.0e12).toLong)
       val throughput_factor = 1.0 / windowSize
+      
+      // it seems like the window orderBy() column can't be a Double
+      val sliding_tp_w = Window.orderBy($"ts").rangeBetween(0, windowSize_l)  //Window.currentRow,(windowSize*1.0e12).toLong)
       
       val start_l:Long = (start * datascale).toLong
       val end_l:Long = (end * datascale).toLong
-
-      val start_time = jpcap.select(min("src.timestamp")).first.getDouble(0)
+      
+      val trace_start_time = jpcap.select(min("src.timestamp")).first.getDouble(0)
+      val start_epoch:Double = start + trace_start_time
+      val end_epoch:Double = end + trace_start_time
+      
       val rxtrace = jpcap.filter("dst.timestamp is not null")
           .withColumn("rxnum", row_number.over(job_partition_w))
-          .withColumn("tsd", $"dst.timestamp" - start_time)
-          .withColumn("ts", (($"dst.timestamp" - start_time)*datascale).cast(LongType))
-          .filter($"ts" >= start_l && $"ts" <= end_l)
+          .filter($"dst.timestamp" >= start_epoch && $"dst.timestamp" <= end_epoch)
+          .withColumn("tsd", $"dst.timestamp" - trace_start_time)
+          .withColumn("ts", (($"dst.timestamp" - trace_start_time)*datascale).cast(LongType))
           .orderBy("ts")
           .persist(MEMORY_AND_DISK)
-      
+                
       // now we can get the first reception of each packet
       val tput = rxtrace.filter("rxnum = 1")
           .withColumn("throughput", sum("framelen").over(sliding_tp_w) * throughput_factor)
           .withColumn("pktcount", sum(lit(1)).over(sliding_tp_w))
-
+      
       // we can get the redundant recptions
       val redundant_tput = rxtrace.filter("rxnum > 1")
           .withColumn("throughput", sum("framelen").over(sliding_tp_w) * throughput_factor)
@@ -543,6 +551,85 @@ object PcapProcessor {
 
       val tpdata = tput.select(lit(tp_label), $"tsd", $"throughput", $"pktcount")
         .union(redundant_tput.select(lit(tpr_label), $"tsd", $"throughput", $"pktcount")).orderBy("tsd")
+        .collect().map( x => Map("title"->x.getString(0), "x"->x.getDouble(1), "y"->x.getDouble(2), "pktcount"->x.getLong(3)))
+        
+      rxtrace.unpersist()
+      
+      return tpdata
+  }
+  
+  
+  /**
+   * Another way to compute the throughput and redundant throughput over some time period.
+   * This method uses rolling/sliding windows of fixed increments.  The benefit of this over
+   * the method above is that you get evenly spaced data points.  Less datapoints in the
+   * regions with lots of packets, and more data points in the regions with few or no packets.
+   * 
+   * One part I find klunky is that the column we do the window over must be TimestampType.
+   * Therefore we cast the timestamps to that type, which gives us timestamps in 1970, do
+   * the windowing, and then convert them back to double.
+   * 
+   * You must specify both:
+   * windowSize = the width of the samples
+   * increment = the amount to move the window by
+   * 
+   * The the time values returned are the start boundaries of the windows.
+   * The smallest precision for windows and increments is 1microsecond.
+   * 
+   */
+  def rollingThroughput(jpcap:Dataset[Row], windowSize:Double, destination:String, start:Double, end:Double, incr:Double, label:String): Array[Map[String,Any]] = {
+      val job_partition_w = Window.partitionBy($"jobid").orderBy($"dst.timestamp".asc)
+
+      if (windowSize < 1e-6) {
+        println("ERROR: rollingThroughput - window size smallest unit is milliseconds")
+        return Array()
+      }
+      
+      if (incr < 1e-6) {
+        println("ERROR: rollingThroughput - increment size smallest unit is milliseconds")
+        return Array()
+      }
+      
+      // smallest window interval string is microseconds, so we have to convert to that
+      val windowSize_us = (windowSize * 1.0e6).toLong
+      val incr_us = (incr * 1.0e6).toLong
+      
+      // when computing throughput we have to account for the fact that the samples
+      // are taken over windows smaller than 1 second.
+      val throughput_factor = 1.0 / windowSize
+            
+      val trace_start_time = jpcap.select(min("src.timestamp")).first.getDouble(0)
+      val start_epoch:Double = start + trace_start_time
+      val end_epoch:Double = end + trace_start_time
+      
+      val rxtrace = jpcap.filter("dst.timestamp is not null")
+          .withColumn("rxnum", row_number.over(job_partition_w))
+          .filter($"dst.timestamp" >= start_epoch && $"dst.timestamp" <= end_epoch)
+          .withColumn("tsd", $"dst.timestamp" - trace_start_time)
+          .withColumn("tsts", $"tsd".cast(TimestampType))
+          .orderBy("tsts")
+          .persist(MEMORY_AND_DISK)
+      
+      // now we can get the first reception of each packet
+      val tput = rxtrace.filter("rxnum = 1")
+          .groupBy(window($"tsts", windowSize_us+ " microseconds", incr_us+ " microseconds"))
+          .agg((sum("framelen")*throughput_factor).as("throughput"), (sum(lit(1))).as("pktcount"))
+          .withColumn("ws", $"window.start".cast(DoubleType))
+          .orderBy("ws")
+               
+      // we can get the redundant recptions
+      val redundant_tput = rxtrace.filter("rxnum > 1")
+          .groupBy(window($"tsts", windowSize_us+ " microseconds", incr_us+ " microseconds"))
+          .agg((sum("framelen")*throughput_factor).as("throughput"), (sum(lit(1))).as("pktcount"))
+          .withColumn("ws", $"window.start".cast(DoubleType))
+          .orderBy("ws")
+      
+      val tp_label = label + " throughput"
+      val tpr_label = label + " redundant"
+      
+      val tpdata = tput.select(lit(tp_label), $"ws", $"throughput", $"pktcount")
+        .union(redundant_tput.select(lit(tpr_label), $"ws", $"throughput", $"pktcount")).orderBy("ws")
+        .filter("ws >= 0.0")
         .collect().map( x => Map("title"->x.getString(0), "x"->x.getDouble(1), "y"->x.getDouble(2), "pktcount"->x.getLong(3)))
         
       rxtrace.unpersist()
