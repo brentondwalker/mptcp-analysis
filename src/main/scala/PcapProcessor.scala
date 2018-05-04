@@ -694,6 +694,119 @@ object PcapProcessor {
 		  return (evalpoints, densities)
   }
 
+  /**
+   * Given a latency dataset as returned by loadProcessPcapLatency(), trim off the specified
+   * number of seconds from the start and end of the data.
+   * 
+   * The intention is to remove the transient slow-start part of te connection, and any
+   * other artifacts experienced at the end of the flow.
+   */
+  def trim(data:Dataset[Row], startTrim:Double, endTrim:Double): Dataset[Row] = {
+      val mm = data.agg(min("src_timestamp")).first.getDouble(0);
+      val mx = data.agg(max("src_timestamp")).first.getDouble(0);
+      return data.filter($"src_timestamp" > (mm+startTrim) && $"src_timestamp" < (mx-endTrim));
+  }
+  
+  
+  /**
+   * In a given trace we want to ask:
+   * - what fraction of the segments are first delivered over each subflow?
+   * - what fraction of the segments sent on both subflows are delivered first
+   *   over each subflow?
+   * - what fraction of the segments lost on one subflow have their first
+   *   delivery over the other subflow?
+   * - what fraction of the segments on each subflow are lost?
+   * - of the segments sent over a subflow, what fraction were resends of lost
+   *   packets on the other subflow?
+   *   
+   * This should only be run on individual pairs of src/dst files.  Otherwise
+   * the DSNs can wrap and you can't work with them.
+   */
+  def lossStatistics(srcfile:String, dstfile:String) {
+    val src_data = pcapReader.readPcap(lspark, srcfile)
+      .filter("proto=6").filter("dsn is not null").filter("dack is not null").filter("framelen > 100")
+    val dst_data = pcapReader.readPcap(lspark, dstfile)
+      .filter("proto=6").filter("dsn is not null").filter("dack is not null").filter("framelen > 100")
+    
+    val packet_ts_w = Window.partitionBy($"dsn",$"tcpseq").orderBy($"timestamp".asc)
+
+    // join the full send data to full receive data
+    // this is a left outer join because the packets may get lost
+    // we use the "duplicate_tx_order" steps to fix extremely rare segments where a TX event matches to multiple RX events
+    // in these cases we keep the row were the RX event matches with the earlier of TX events
+    val txrx = src_data
+      .withColumn("next_ts", lead("timestamp", 1, Double.PositiveInfinity).over(packet_ts_w)).as("src")
+      .join(dst_data.withColumnRenamed("timestamp","rx_timestamp").withColumnRenamed("framenumber","rx_framenumber").as("dst"),
+            $"src.dsn"===$"dst.dsn" && $"src.src"===$"dst.src" && $"src.dst"===$"dst.dst" && $"src.timestamp"<$"rx_timestamp" && $"src.next_ts">$"rx_timestamp" && ($"rx_timestamp"-$"src.timestamp")<1.0,
+            "left_outer")
+      .drop($"dst.src").drop($"dst.dst").drop($"dst.srcport").drop($"dst.dstport").drop($"dst.proto").drop($"dst.framelen").drop($"dst.dack").drop($"dst.dsn").drop($"dst.tcpseq").drop($"dst.tcpack")
+      .na.fill(Double.PositiveInfinity, Seq("rx_timestamp"))
+      .withColumn("duplicate_tx_order", count("*").over(Window.partitionBy($"timestamp",$"framenumber").orderBy($"timestamp")))
+      .filter("duplicate_tx_order=1").drop("duplicate_tx_order")
+      .withColumn("rx_order", row_number.over(Window.partitionBy("dsn").orderBy("rx_timestamp")))
+      .withColumn("tx_order", row_number.over(Window.partitionBy("dsn").orderBy("timestamp")))
+      .withColumn("latency",$"rx_timestamp"-$"timestamp")
+      .orderBy($"dsn".asc,$"timestamp".asc)
+      .persist()
+      //.withColumn("seg_id",row_number.over(Window.orderBy($"src.dsn".asc,$"src.timestamp".asc)))
+    
+    // figure out which DSNs got sent more than once
+    val dup_dsn = src_data.groupBy("dsn").count.filter("count>1").persist
+    
+    // get a list of all DSNs that experience at least one loss
+    val drop_dsns = txrx.filter($"rx_framenumber".isNull).select($"dsn").distinct.orderBy("dsn").persist
+    println("all losses = "+txrx.join(drop_dsns,"dsn").select($"dsn").distinct.count)
+    
+    // get a list of all DSNs that experience a loss on the long fat subflow
+    val drop_lfs_dsns = txrx.filter($"rx_framenumber".isNull).filter("src.src='10.1.2.2'").select($"dsn").distinct.orderBy("dsn").persist
+    println("lfs losses = "+txrx.join(drop_lfs_dsns,"dsn").select($"dsn").distinct.count)
+    
+    // get a list of the DSNs that are sent on both subflows
+    val tx_both_subflows_dsns = txrx.withColumn("maxseq",max($"src.tcpseq").over(Window.partitionBy($"src.dsn")))
+      .withColumn("minseq",min($"src.tcpseq").over(Window.partitionBy($"src.dsn")))
+      .filter("maxseq != minseq")
+      .select($"dsn").distinct.orderBy($"dsn".asc)
+      .persist
+    
+    // the segments that are sent on both subflows and experience a loss on the long fat subflow
+    /*
+     * Here we start to see segments that are lost on the long fat subflow, resent on the
+     * short skinny subflow, and delivered first over the short skinny subflow.  Because the
+     * duplicate ACKs are already in flight, they are generally also resent over the long fat
+     * subflow too.
+     * In some cases we see that the long fat subflow resend takes place after the segment
+     * is already received over the short skinny one.
+     * We would like to know what fraction of the segments lost over the long fat subflow
+     * end up being delivered first over the short skinny subflow.
+     */
+    val sss_loss_corrections = txrx.join(drop_lfs_dsns,"dsn").join(tx_both_subflows_dsns,"dsn")
+      .orderBy($"dsn".asc,$"timestamp".asc)
+      .filter("rx_order=1 AND src='10.1.3.2'")
+      .select($"dsn").distinct
+      .count
+    println("sss_loss_corrections = "+sss_loss_corrections)
+    
+    // segments sent over sss
+    println("segments sent over sss: "+txrx.filter("src='10.1.3.2'").select($"dsn").distinct.count)
+
+    // segments sent over sss arriving first
+    println("segments sent over sss arriving first: "+txrx.filter("rx_order=1 AND src='10.1.3.2'").select($"dsn").distinct.count)
+
+    // segments sent over lfs
+    println("segments sent over lfs: "+txrx.filter("src='10.1.2.2'").select($"dsn").distinct.count)
+
+    // segments sent over lfs arriving first
+    println("segments sent over lfs arriving first: "+txrx.filter("rx_order=1 AND src='10.1.2.2'").select($"dsn").distinct.count)
+    
+    // how often is a segment sent over the sss first?
+    println("segments sent first over sss: "+txrx.filter("tx_order=1 AND src='10.1.3.2'").select($"dsn").distinct.count)
+    
+    // would like to know the number of segments sent first on the lfs, but arriving first on the sss
+    val lfs_txfirst_dsns = txrx.filter("tx_order=1 AND src='10.1.2.2'").select($"dsn").distinct.persist
+    println("segments sent first over lfs, arriving first over sss: "+txrx.filter("rx_order=1 AND src='10.1.3.2'").join(lfs_txfirst_dsns,"dsn").select($"dsn").distinct.count)
+    
+    txrx.unpersist()
+  }
   
   
 }
