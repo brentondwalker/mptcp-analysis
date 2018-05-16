@@ -53,6 +53,36 @@ object pcapReader {
 				  .schema(pcapSchema)
 				  .csv(filename)
 	}
+
+	/**
+	 * Schema and loading code for DITG receiver logs.
+	 * These are produced by running something like:
+	 * ~/ditg/bin/ITGDec receiver.log -o receiverlog.out
+	 */
+	val ditgSchema = StructType(Array(
+	    StructField("framenumber", LongType, false),
+	    StructField("tx_hour", IntegerType, false),
+	    StructField("tx_minute", IntegerType, false),
+	    StructField("tx_second", DoubleType, false),
+	    StructField("rx_hour", IntegerType, false),
+	    StructField("rx_minute", IntegerType, false),
+	    StructField("rx_second", DoubleType, false),
+	    StructField("datasize", IntegerType, false)));
+
+	/**
+	 * read in the DITG receiver file
+	 */
+	def readDitg(spark: SparkSession, filename: String): Dataset[Row] = {
+	  return spark.read
+					.option("sep"," ")
+				  .option("nullValue","NULL")
+				  .option("mode","DROPMALFORMED")
+				  .option("ignoreLeadingWhiteSpace", true)
+				  .option("ignoreTrailingWhiteSpace", true)				  
+				  .schema(ditgSchema)
+				  .csv(filename);
+	}
+	
 	
 }
 

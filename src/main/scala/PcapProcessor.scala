@@ -67,8 +67,9 @@ object PcapProcessor {
         .filter("proto=6").filter("dsn is not null").filter("dack is not null")
         .groupBy($"dsn").agg(min($"timestamp").alias("dst_timestamp"),min("framelen").alias("dst_len"))
     
-    return src_data.as("src").join(dst_data.as("dst"), "dsn")
+    return src_data.as("src").join(dst_data.as("dst"), $"src.dsn"===$"dst.dsn" && $"src_timestamp"<$"dst_timestamp" && ($"dst_timestamp" - $"src_timestamp")<10.0)
       .withColumn("latency", $"dst_timestamp" - $"src_timestamp")
+      .drop($"dst.dsn")
   }
   
   
@@ -86,10 +87,23 @@ object PcapProcessor {
         .filter("proto=6").filter("tcpseq is not null").filter("tcpack is not null")
         .groupBy($"tcpseq").agg(min($"timestamp").alias("dst_timestamp"),min("framelen").alias("dst_len"))
     
-    return src_data.as("src").join(dst_data.as("dst"), "tcpseq")
+    return src_data.as("src").join(dst_data.as("dst"), $"src.tcpseq"===$"dst.tcpseq" && $"src_timestamp"<$"dst_timestamp" && ($"dst_timestamp" - $"src_timestamp")<10.0)
       .withColumn("latency", $"dst_timestamp" - $"src_timestamp")
+      .drop($"dst.tcpseq")
   }
 
+  
+  /**
+   * Load a DITG receiver data file and compute the latencies.
+   * This is pretty simple since the data is all in a single file and
+   * the TX and RX timestamps are already matched up.
+   */
+  def loadProcessDitgLatency(rxfile:String): Dataset[Row] = {
+    return pcapReader.readDitg(lspark, rxfile)
+      .withColumn("src_timestamp", $"tx_hour".cast("Double")*3600 + $"tx_minute".cast("Double")*60 + $"tx_second")
+      .withColumn("dst_timestamp", $"rx_hour".cast("Double")*3600 + $"rx_minute".cast("Double")*60 + $"rx_second")
+      .withColumn("latency", $"dst_timestamp" - $"src_timestamp")
+  }
   
   
   /**
@@ -152,7 +166,7 @@ object PcapProcessor {
    * we have, this should be fine.
    */
   def latencyCdf(ldf:Dataset[Row], numpoints:Integer): (Array[Double], Array[Double]) = {
-        val ldfcount:Long = ldf.count();
+    val ldfcount:Long = ldf.count();
     val ldfcount_d = ldfcount.toDouble
     val n = if (numpoints > 0) numpoints+1 else ldfcount+1
     val cdfx = new ListBuffer[Double] ();
@@ -289,6 +303,44 @@ object PcapProcessor {
     return jpcap_l.select("latency").map(x => x.getDouble(0)).rdd.histogram(bins)
   }
   
+  
+  /**
+   * A small modification of latencyCcdf to compute the epsilon-quantile for a
+   * set of latency data.
+   * 
+   * For any epsilon and a dataset with N rows, it returns the latency, l, for
+   * which (1-epsilon)N of the datapoints are less than l.
+   */
+  def latencyQuantile(ldf:Dataset[Row], epsilon:Double): Double = {
+    val N = ldf.count()
+    val Nd = N.toDouble
+    if (N*epsilon < 1.0) {
+      print("ERROR: latencyQuantile(): not enough datapoints ("+N+") to compute quantile "+epsilon)
+      return -1.0
+    }
+    
+    val qi = Math.floor(N*(1.0-epsilon)).toInt
+    val remainder = N*(1.0-epsilon) - qi
+    val ldfs = ldf.select("latency").orderBy("latency").collect.map(x => x.getDouble(0));
+    if (remainder > 0) {
+      return ldfs(qi) + (ldfs(qi+1) - ldfs(qi))*remainder
+    }
+    return ldfs(qi)
+  }
+
+  
+  /**
+   * Save the processed latency data so we can load it in Matlab or something.
+   */
+  def saveLatencyData(ldf:Dataset[Row], filename:String) {
+    import java.io._
+    val pw = new PrintWriter(new File(filename))
+    val seqnum_column = ldf.columns(0)
+    ldf.orderBy(seqnum_column).collect.foreach(r => pw.write(r.mkString("\t")))
+    pw.close
+  }
+  
+    
   
   /**
    * Loads the corresponding src/dst pcaps
@@ -665,8 +717,8 @@ object PcapProcessor {
    * Estimate the pdf of latency data using mllib's KernelDensity class.
    * 
    * XXX: we do two operations on the data Dataset, and who knows what goes on inside KernelDensity.
-   *      Should we persist/unpersist it?  Te issue would be if it's already persisted, we don't want
-   *      to unpersist it.
+   *      Should we persist/unpersist it? The issue would be if it's already persisted, we
+   *      don't want to unpersist it.
    */
   def genericPdf(data:Dataset[Row], colname:String, numpoints:Double): (Array[Double], Array[Double]) = {
       
@@ -701,7 +753,7 @@ object PcapProcessor {
    * The intention is to remove the transient slow-start part of te connection, and any
    * other artifacts experienced at the end of the flow.
    */
-  def trim(data:Dataset[Row], startTrim:Double, endTrim:Double): Dataset[Row] = {
+  def ttrim(data:Dataset[Row], startTrim:Double, endTrim:Double): Dataset[Row] = {
       val mm = data.agg(min("src_timestamp")).first.getDouble(0);
       val mx = data.agg(max("src_timestamp")).first.getDouble(0);
       return data.filter($"src_timestamp" > (mm+startTrim) && $"src_timestamp" < (mx-endTrim));
@@ -755,11 +807,13 @@ object PcapProcessor {
     
     // get a list of all DSNs that experience at least one loss
     val drop_dsns = txrx.filter($"rx_framenumber".isNull).select($"dsn").distinct.orderBy("dsn").persist
-    println("all losses = "+txrx.join(drop_dsns,"dsn").select($"dsn").distinct.count)
+    val drop_dsns_count = txrx.join(drop_dsns,"dsn").select($"dsn").distinct.count
+    println("all losses = "+drop_dsns_count)
     
     // get a list of all DSNs that experience a loss on the long fat subflow
     val drop_lfs_dsns = txrx.filter($"rx_framenumber".isNull).filter("src.src='10.1.2.2'").select($"dsn").distinct.orderBy("dsn").persist
-    println("lfs losses = "+txrx.join(drop_lfs_dsns,"dsn").select($"dsn").distinct.count)
+    val drop_lfs_dsns_count = txrx.join(drop_lfs_dsns,"dsn").select($"dsn").distinct.count
+    println("lfs losses = "+drop_lfs_dsns_count)
     
     // get a list of the DSNs that are sent on both subflows
     val tx_both_subflows_dsns = txrx.withColumn("maxseq",max($"src.tcpseq").over(Window.partitionBy($"src.dsn")))
@@ -779,24 +833,28 @@ object PcapProcessor {
      * We would like to know what fraction of the segments lost over the long fat subflow
      * end up being delivered first over the short skinny subflow.
      */
-    val sss_loss_corrections = txrx.join(drop_lfs_dsns,"dsn").join(tx_both_subflows_dsns,"dsn")
+    val sss_loss_corrections_count = txrx.join(drop_lfs_dsns,"dsn").join(tx_both_subflows_dsns,"dsn")
       .orderBy($"dsn".asc,$"timestamp".asc)
       .filter("rx_order=1 AND src='10.1.3.2'")
       .select($"dsn").distinct
       .count
-    println("sss_loss_corrections = "+sss_loss_corrections)
+    println("sss_loss_corrections = "+sss_loss_corrections_count+"   "+(100.0*sss_loss_corrections_count.toDouble/drop_lfs_dsns_count.toDouble))
+    println("lfs losses not corrected = "+(drop_lfs_dsns_count-sss_loss_corrections_count))
     
     // segments sent over sss
-    println("segments sent over sss: "+txrx.filter("src='10.1.3.2'").select($"dsn").distinct.count)
+    val sss_segment_count = txrx.filter("src='10.1.3.2'").select($"dsn").distinct.count
+    println("segments sent over sss = "+sss_segment_count)
 
     // segments sent over sss arriving first
-    println("segments sent over sss arriving first: "+txrx.filter("rx_order=1 AND src='10.1.3.2'").select($"dsn").distinct.count)
+    val sss_arriving_first = txrx.filter("rx_order=1 AND src='10.1.3.2'").select($"dsn").distinct.count
+    println("segments sent over sss arriving first: "+sss_arriving_first+"    "+(100.0*sss_arriving_first.toDouble/sss_segment_count.toDouble))
 
     // segments sent over lfs
     println("segments sent over lfs: "+txrx.filter("src='10.1.2.2'").select($"dsn").distinct.count)
 
     // segments sent over lfs arriving first
-    println("segments sent over lfs arriving first: "+txrx.filter("rx_order=1 AND src='10.1.2.2'").select($"dsn").distinct.count)
+    val lfs_arriving_first = txrx.filter("rx_order=1 AND src='10.1.2.2'").select($"dsn").distinct.count
+    println("segments sent over lfs arriving first: "+lfs_arriving_first)
     
     // how often is a segment sent over the sss first?
     println("segments sent first over sss: "+txrx.filter("tx_order=1 AND src='10.1.3.2'").select($"dsn").distinct.count)
@@ -807,6 +865,11 @@ object PcapProcessor {
     
     txrx.unpersist()
   }
+  
+  
+//  def totalDataTransfer(data:Dataset[Row]): Long = {
+//    
+//  }
   
   
 }
