@@ -82,10 +82,14 @@ object PcapProcessor {
     
     val src_data = pcapReader.readPcap(lspark, srcfile)
         .filter("proto=6").filter("tcpseq is not null").filter("tcpack is not null")
-        .groupBy($"tcpseq").agg(min($"timestamp").alias("src_timestamp"),min("dst").alias("dst"),min("framelen").alias("src_len"))
+        .groupBy($"tcpseq",$"srcport",$"dstport",$"framelen")
+        .agg(min($"timestamp").alias("src_timestamp"),min("dst").alias("dst"),min("framelen").alias("src_len"))
+        .drop("framelen","srcport","dstport")
     val dst_data = pcapReader.readPcap(lspark, dstfile)
         .filter("proto=6").filter("tcpseq is not null").filter("tcpack is not null")
-        .groupBy($"tcpseq").agg(min($"timestamp").alias("dst_timestamp"),min("framelen").alias("dst_len"))
+        .groupBy($"tcpseq",$"srcport",$"dstport",$"framelen")
+        .agg(min($"timestamp").alias("dst_timestamp"),min("framelen").alias("dst_len"))
+        .drop("framelen","srcport","dstport")
     
     return src_data.as("src").join(dst_data.as("dst"), $"src.tcpseq"===$"dst.tcpseq" && $"src_timestamp"<$"dst_timestamp" && ($"dst_timestamp" - $"src_timestamp")<10.0)
       .withColumn("latency", $"dst_timestamp" - $"src_timestamp")
@@ -315,7 +319,7 @@ object PcapProcessor {
     val N = ldf.count()
     val Nd = N.toDouble
     if (N*epsilon < 1.0) {
-      print("ERROR: latencyQuantile(): not enough datapoints ("+N+") to compute quantile "+epsilon)
+      println("ERROR: latencyQuantile(): not enough datapoints ("+N+") to compute quantile "+epsilon)
       return -1.0
     }
     
@@ -336,10 +340,23 @@ object PcapProcessor {
     import java.io._
     val pw = new PrintWriter(new File(filename))
     val seqnum_column = ldf.columns(0)
-    ldf.orderBy(seqnum_column).collect.foreach(r => pw.write(r.mkString("\t")))
+    ldf.orderBy(seqnum_column).collect.foreach(r => pw.write(r.mkString("\t")+"\n"))
     pw.close
   }
   
+  
+  /**
+   * Save off a line of data containing the mean latency and then several
+   * quantile values.
+   */
+  def saveMeanQuantileLatencyData(ldf:Dataset[Row], filename:String) {
+    import java.io._
+    val pw = new PrintWriter(new File(filename))
+    pw.write("% mean\t0.01\t0.001\t0.0001\t0.00001\n")
+    pw.write(ldf.agg(mean("latency")).collect.map(r => r.getDouble(0)).head.toString
+        +"\t"+Array(0.01, 0.001, 0.0001, 0.00001).map(x => latencyQuantile(ldf, x)*1000).mkString("\t")+"\n")
+    pw.close
+  }
     
   
   /**
@@ -865,6 +882,29 @@ object PcapProcessor {
     
     txrx.unpersist()
   }
+  
+  
+  /**
+   * We want to look at the trace and see when the data sequence numbers on a
+   * subflow jump either forward or backward.  Looking at this by hand is very
+   * tedious, so we need to add the jump number as a column.
+   */
+  def dsnJumps(srcfile:String, dstfile:String): Dataset[Row] = {
+    val src_data = pcapReader.readPcap(lspark, srcfile)
+      .filter("proto=6").filter("dsn is not null").filter("dack is not null")
+    val dst_data = pcapReader.readPcap(lspark, dstfile)
+      .filter("proto=6").filter("dsn is not null").filter("dack is not null")
+    
+    val dsn_jump_w = Window.partitionBy($"src").orderBy($"timestamp".asc)
+    
+    // we need to look at the streams from the sender IPs one at a time.
+    // for starters we only care about the lagging subflow.
+    src_data.orderBy("timestamp")   //.filter("src='10.1.3.2'")
+      .withColumn("nextseq", $"dsn"+$"framelen")
+      .withColumn("expectedseq", lag("nextseq", 1, 0).over(dsn_jump_w))
+      .orderBy("timestamp")
+  }
+  
   
   
 //  def totalDataTransfer(data:Dataset[Row]): Long = {

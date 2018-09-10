@@ -20,7 +20,7 @@ object pcapReader {
    * 5. ip.dst 
    * 6. tcp.dstport 
    * 7. ip.proto 
-   * 8. frame.len 
+   * 8. frame.len (changed this to tcp.len to better compute seq nums)
    * 9. tcp.seq 
    * 10. tcp.ack 
    * 11. tcp.options.mptcp.rawdataseqno (dsn)
@@ -54,6 +54,7 @@ object pcapReader {
 				  .csv(filename)
 	}
 
+	
 	/**
 	 * Schema and loading code for DITG receiver logs.
 	 * These are produced by running something like:
@@ -83,6 +84,50 @@ object pcapReader {
 				  .csv(filename);
 	}
 	
+	
+	/**
+   * Fields in the file are:
+   * 1. frame.number 
+   * 2. frame.time_epoch 
+   * 3. erf.flags.cap (Capture Interface)
+   * 4. ip.src 
+   * 5. tcp.srcport 
+   * 6. ip.dst 
+   * 7. tcp.dstport 
+   * 8. ip.proto 
+   * 9. frame.len (changed this to tcp.len to better compute seq nums)
+   * 10. tcp.seq 
+   * 11. tcp.ack 
+   * 
+   * 	tshark -r test.erf -T fields -e frame.number -e frame.time_epoch -e erf.flags.cap
+   *         -e ip.src -e tcp.srcport -e ip.dst -e tcp.dstport -e ip.proto -e tcp.len
+   *         -e tcp.seq -e tcp.ack > test.csv
+   */
+	val erfSchema = StructType(Array(
+			StructField("framenumber", LongType, false),
+			StructField("timestamp", DoubleType, true),
+			StructField("cap",IntegerType, true),
+			StructField("src", StringType, false),
+			StructField("srcport", IntegerType, false),
+			StructField("dst", StringType, true),
+			StructField("dstport", IntegerType, false),
+			StructField("proto", IntegerType, true),
+			StructField("framelen", IntegerType, true),
+			StructField("tcpseq", IntegerType, true),
+			StructField("tcpack", IntegerType, true)));
+
+	/**
+	 * read in the task events file(s)
+	 */
+	def readErf(spark: SparkSession, filename: String): Dataset[Row] = {
+			return spark.read
+					.option("sep","\t")
+				  .option("nullValue","NULL")
+				  .option("mode","DROPMALFORMED")
+				  .schema(erfSchema)
+				  .csv(filename)
+	}
+
 	
 }
 
